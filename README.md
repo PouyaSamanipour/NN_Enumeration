@@ -26,7 +26,7 @@ The package requires the following dependencies, which will be installed automat
 ``` sh
 python3 -m venv myenv
 source myenv/bin/activate
-pip install -r requirements.txt
+pip install -r requirement.txt
 ```
 - `numpy`
 - `numba`
