@@ -22,8 +22,12 @@ pip install Enumeration_module
 --- -->
 
 ## **Dependencies**
-The package requires the following dependencies, which will be installed automatically with `pip install -r requirement.txt`:
-
+The package requires the following dependencies, which will be installed automatically with 
+``` sh
+python3 -m venv myenv
+source myenv/bin/activate
+pip install -r requirements.txt
+```
 - `numpy`
 - `numba`
 - `torch`
