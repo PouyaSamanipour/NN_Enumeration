@@ -22,7 +22,7 @@ pip install Enumeration_module
 --- -->
 
 ## **Dependencies**
-The package requires the following dependencies, which will be installed automatically with `pip install -r requirements.txt`:
+The package requires the following dependencies, which will be installed automatically with `pip install -r requirement.txt`:
 
 - `numpy`
 - `numba`
