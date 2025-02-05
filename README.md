@@ -11,13 +11,6 @@ To install this package, first, clone the repository and navigate to the package
 git clone https://github.com/PouyaSamanipour/NN_Enumeration.git
 cd NN_Enumeration
 ```
-
-Then, install the package along with its dependencies using:
-
-```sh
-pip install Enumeration_module
-```
-
 <!-- This will install the package in **editable mode**, allowing you to modify the code without reinstalling. -->
 
 <!-- Alternatively, if the package is published on PyPI, install it directly with:
