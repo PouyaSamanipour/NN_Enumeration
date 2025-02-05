@@ -62,7 +62,7 @@ $\dot{x} = W\sigma(Hx + b) + c $
 
 In this file, $TH$ is the threshold of the domain that we cosidered enymeration. Our domain in this version is defined as:
 
-$\mathcal D=\{x\in \mathbb R^n:||x||_\infty\leq TH\}$. 
+$\mathcal D=\{x\in \mathbb R^n:|x|_\infty\leq TH\}$. 
 
 **"Note: It is recommended to set `parallel=True` in complex examples."**  
 
