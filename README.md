@@ -36,7 +36,7 @@ The package requires the following dependencies, which will be installed automat
 - `torch`
 - `scipy`
 - `matplotlib`
-- `cddlib`
+- `pycddlib`
 - `pandas` (for CSV handling)
 
 If not installed automatically, you can manually install them using:

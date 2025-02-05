@@ -1,5 +1,4 @@
 from Enumeration_module import enumeration_function
-
 # from Enumeration_module import enumeration_function
 # from Enum_module_old import enumeration_function
 mode="Rapid_mode" 

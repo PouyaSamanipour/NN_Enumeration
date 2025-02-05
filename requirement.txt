@@ -5,3 +5,4 @@ scipy
 matplotlib
 pycddlib
 pandas  # For CSV handling
+torch

@@ -12,6 +12,7 @@ import time
 # from plot_res import plot_polytope
 # from plot_res import plot_polytope_2D
 # from utils import Enumerator_rapid
+from .utils_Enumeration import *
 from .utils_Enumeration import Enumerator_rapid
 from .utils_Enumeration import finding_deep_hype
 from .utils_CSV import Enumerator
