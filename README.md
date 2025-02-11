@@ -69,29 +69,10 @@ Modify the `NN_file` variable in `script.py` to point to the desired **Neural Ne
 ```python
 NN_file = "path/to/NN_file.pt"
 ```
+It outputs two types of pickle files:
 
-<!-- ### **3. Setting the Output File Name**
-Define the name of the **output file** where results will be stored:
-
-```python
-name = "output_file"
-```
-
-All results, including the **enumerated vertices**, will be stored in:
-
-```
-cwd:/Results/output_file.m
-```
-
---- -->
-
-<!-- ## **Using Neural Network Identification**
-The package includes a **Neural Network Identification** script in the `Neural/` folder:
-
-- **`nn_simple.py`**: This script helps in **training and saving a single-hidden-layer ReLU network** for a given dynamical system.
-- The trained network is stored in a **`.pt`** file, which can be used as input for the enumeration algorithm.
-
---- -->
+- Polytopes: A collection of vertices for each polytope in the activation space.
+- Cell ID: Information about which neurons (ReLU units) are active in each layer for each enumerated polytope.
 
 ## **Example Results**
 Below is an example of the enumeration results, showing the number of **hyperplanes, computed cells, and execution time** for different neural network models.

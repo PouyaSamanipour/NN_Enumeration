@@ -4,9 +4,6 @@ from numba import njit
 import numpy as np
 # from scipy.spatial import Delaunay
 from itertools import combinations,product
-# import matplotlib.pyplot as plt
-# from mpl_toolkits.mplot3d import Axes3D
-# from scipy.spatial import ConvexHull, convex_hull_plot_2d
 import time
 import os
 from scipy.optimize import linprog
@@ -15,19 +12,8 @@ from numpy.linalg import matrix_rank
 from numpy.linalg import inv
 from numba import prange
 import torch
-#import cdd
-# import cupy as cp
-# import concurrent.futures
-# import multiprocessing
-# from numba import prange
-# import concurrent.futures
-# from multiprocessing import Pool 
-# from concurrent.futures import ThreadPoolExecutor
-# from functools import partial
+import cdd
 import math
-# from multiprocessing.pool import ThreadPool
-# from numba import vectorize, float64,int64
-# from memory_profiler import profile
 def Polytope_formation(original_polytope, boundary_hyperplane, hyperplanes, b, hyperplane_val,Th):
     # Initialize empty lists to store the two polytopes
     poly1 = []
@@ -53,7 +39,8 @@ def Polytope_formation(original_polytope, boundary_hyperplane, hyperplanes, b, h
             intersection = np.linalg.solve(np.vstack((E1, E2)), np.array([-e1, -e2]))
 
             # Check if the intersection point is within a certain norm threshold (0.9001)
-            if np.linalg.norm(intersection, ord=np.inf) <= Th+0.00001:
+            if  np.all(Th-intersection>-1e-05) and np.all(intersection+Th>-1e-05):
+            # if np.linalg.norm(intersection-Th, ord=np.inf) <= 0.00001:
             # if Convex_combination(original_polytope,intersection):
                 # If the intersection point is valid, append it to the list
                 intersection_points.append(intersection.tolist())
@@ -414,13 +401,13 @@ def check_valid_side(valid_side,sides,hyperplane_val,hyp_f,hyperplanes,b,n,TH,pa
                     valid_combination=check_combination_parallel(TH,np.array(list_final),n,sides,hyperplane_val,np.array(hyp_f),hyperplanes,b,sign_m)                    
                     del list_final
                 else:
-                    valid_combination=check_combination(np.array(list_final),sides,hyperplane_val,np.array(hyp_f),hyperplanes,b,TH)
+                    valid_combination=check_combination(np.array(list_final),sides,hyperplane_val,np.array(hyp_f),hyperplanes,b,np.array(TH))
                     del list_final
                 list_final=[]
                 intersection_test.extend(valid_combination)
         else: 
             if len(list_final)>=len_batch or j==len(lst_new)-1:
-                valid_combination=check_combination(np.array(list_final),sides,hyperplane_val,np.array(hyp_f),hyperplanes,b,TH)
+                valid_combination=check_combination(np.array(list_final),sides,hyperplane_val,np.array(hyp_f),hyperplanes,b,np.array(TH))
                 list_final=[]
                 intersection_test.extend(valid_combination)
 
@@ -497,7 +484,8 @@ def check_combination(comb_n,sides,hyperplane_val,hyp_f,hyperplanes,b,TH):
             b_new[0:n-1]=(hyp_f[f])[:,n:n+1]
             b_new[n-1]=b
             dum=np.linalg.solve(list_sides,-b_new)
-            if np.linalg.norm(dum, ord=np.inf) <= TH+0.00001:
+            if np.all(TH-dum[:,0]>-1e-05) and np.all(TH-dum[:,0]>-1e-05):
+            # if np.linalg.norm(dum, ord=np.inf) <= TH+0.00001:
                 valid_comb=np.vstack((valid_comb,dum.T))
     ret=valid_comb[1:]        
     return ret
@@ -550,7 +538,7 @@ def removing_unnecessary_comb(valid_side,sides,n,hyperplane_val):
 def check_combination_parallel(TH,list1,n,sides,hyperplane_val,hyp_f,hyperplanes,b,sign_m):
     # list1_n=check_combination_test(list1,sides,hyperplane_val)
     valid_comb1=1000*np.ones((len(list1),n))
-    valid_combination=check_combination_p(np.array(list1),sides,hyperplane_val,np.array(hyp_f),hyperplanes,b,TH,valid_comb1,sign_m)
+    valid_combination=check_combination_p(np.array(list1),sides,hyperplane_val,np.array(hyp_f),hyperplanes,b,valid_comb1,sign_m)
     valid_combination = valid_combination[~np.all(valid_combination == 1000, axis=1)]
     # valid_combination1=check_combination_p1(np.array(list1),sides,hyperplane_val,np.array(hyp_f),hyperplanes,b,TH,valid_comb1,sign_m)
     # valid_combination1 = valid_combination[~np.all(valid_combination == 10*TH, axis=1)]
@@ -560,7 +548,7 @@ def check_combination_parallel(TH,list1,n,sides,hyperplane_val,hyp_f,hyperplanes
     return list(valid_combination)
 
 @njit(parallel=True,fastmath=True)
-def check_combination_p(comb_n,sides,hyperplane_val,hyp_f,hyperplanes,b,TH,valid_comb,sign_m):    
+def check_combination_p(comb_n,sides,hyperplane_val,hyp_f,hyperplanes,b,valid_comb,sign_m):    
     n=len(hyp_f[0])-1
     for f in prange(comb_n.shape[0]):
         list_sides=np.zeros((n,n))
@@ -1065,7 +1053,6 @@ def finding_deep_hype(hyperplanes,b,S_prime,border_hyperplane,border_bias,i,n):
 
 
 @njit(parallel=True)
-
 def func_np(hype_n,intersection_n,sign_m,n,intersection_test1):
     slope=np.zeros((len(hype_n),n))
     slope[:,:]=hype_n[:,0:n]
