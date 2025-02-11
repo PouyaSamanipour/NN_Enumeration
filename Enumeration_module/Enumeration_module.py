@@ -54,25 +54,7 @@ def enumeration_function(NN_file,name,TH,mode,parallel):
                 b.append(params[i])
     W=params[-2]
     c=params[-1]
-    shape=(1_000_000,6)
     D=[]
-    # x=np.linspace(-2.0, 2.0, 200)
-    # y=np.linspace(-2.0, 2.0, 200)
-    # z=np.linspace(-2.0, 2.0, 200)
-    # X,Y,Z=np.meshgrid(x,y,z)
-    # X_train=np.vstack((X.flatten(),Y.flatten(),Z.flatten())).T
-
-    # # for j in range(30):
-    # #     X_train=np.random.uniform(-2, 2, size=shape)
-    # #     # X_train=torch.tensor(X_train).float()
-    # for i in X_train:
-    #     val1=np.maximum(hyperplanes[0]@i+b[0],0)
-    #     D1=np.sign(val1)
-    #     val2=hyperplanes[1]@val1+b[1]
-    #     D2=np.sign(val2)
-    #     nD=np.hstack((D1,D2))
-    #     D.append(nD)
-    # D=list(np.unique(np.array(D),axis=0))
     n_h,n=np.shape(hyperplanes[0])
     original_polytope_test=np.array([generate_hypercube_vertices(n,TH,-TH)])
     cwd=os.getcwd()
@@ -112,17 +94,6 @@ def enumeration_function(NN_file,name,TH,mode,parallel):
         enumerate_poly.extend(Enum)
         Enum=[]
     D=[]
-    # for i in enumerate_poly:
-    #     mid_point=np.mean(i,axis=0)
-    #     val1=np.maximum(hyperplanes[0]@mid_point+b[0],0)
-    #     D1=np.sign(val1)
-    #     val2=np.maximum(hyperplanes[1]@val1+b[1],0)
-    #     D2=np.sign(val2)
-    #     val2=np.maximum(hyperplanes[2]@val2+b[2],0)
-    #     D3=np.sign(val2)
-    #     nD=np.hstack((D1,D2,D3))
-    #     D.append(nD)
-    
     enumeration_time=enumeration_time+(end_enum-st_enum)
 
     end_process=time.time()

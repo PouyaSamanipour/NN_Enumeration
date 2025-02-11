@@ -2,11 +2,11 @@ import numba as nb
 from numba.typed import List
 from numba import njit
 import numpy as np
-from scipy.spatial import Delaunay
+# from scipy.spatial import Delaunay
 from itertools import combinations,product
 # import matplotlib.pyplot as plt
 # from mpl_toolkits.mplot3d import Axes3D
-from scipy.spatial import ConvexHull, convex_hull_plot_2d
+# from scipy.spatial import ConvexHull, convex_hull_plot_2d
 import time
 import os
 from scipy.optimize import linprog
@@ -36,6 +36,7 @@ def Polytope_formation(original_polytope, boundary_hyperplane, hyperplanes, b, h
     # Extract hyperplanes and bias for the first polytope
     E1 = hyperplanes
     e1 = b
+    Threshold=1e-12
 
     # Initialize a list to store intersection points
     intersection_points = []
@@ -66,32 +67,49 @@ def Polytope_formation(original_polytope, boundary_hyperplane, hyperplanes, b, h
     # # Add intersection points to both polytopes
     # poly1.extend(intersection_points)
     # poly2.extend(intersection_points)
+    if len(intersection_points)>0:
+        poly1=np.vstack((original_polytope[hyperplane_val >= -Threshold],intersection_points))
+        poly2=np.vstack((original_polytope[hyperplane_val <= Threshold],intersection_points))
+    else:
+        poly1=original_polytope[hyperplane_val >= -Threshold]
+        poly2=original_polytope[hyperplane_val <= Threshold]
 
-    poly1=np.vstack((original_polytope[hyperplane_val >= -1e-13],intersection_points))
-    poly2=np.vstack((original_polytope[hyperplane_val <= 1e-13],intersection_points))
+    if len(poly1)<len(original_polytope[0])+1:
+        raise Warning("problem, number of vertices in poly1, You need to change the Threshold for this problem")
+    if len(poly2)<len(original_polytope[0])+1:
+        raise Warning("problem, number of vertices in poly2, You need to change the Threshold for this problem")
+    return [poly1, poly2]    
+    # poly1=np.vstack((original_polytope[hyperplane_val >= -1e-13],intersection_points))
+    # poly2=np.vstack((original_polytope[hyperplane_val <= 1e-13],intersection_points))
     # Return the two polytopes
     return [poly1, poly2]
 # @njit
 def Polytope_formation_hd(original_polytope, hyperplane_val,Th,intersection_test):
     # Initialize empty lists to store the two polytopes
-    poly1 = []
-    poly2 = []
-    if len(intersection_test)<len(original_polytope[0])-1:
-        raise Warning("Number of intersection points must be at least n-1")
-    # Extract points from the original polytope based on hyperplane values
-    poly1=np.vstack((original_polytope[hyperplane_val >= -1e-13],intersection_test))
-    poly2=np.vstack((original_polytope[hyperplane_val <= 1e-13],intersection_test))
-    # poly1.append((original_polytope[hyperplane_val >= -1e-13]))
-    # poly2.append((original_polytope[hyperplane_val <= 1e-13]))
+    # poly1 = []
+    # poly2 = []
+    Threshold=1e-12
+    if len(intersection_test)>0:
+            poly1 = []
+            poly2 = []
+            if len(intersection_test)<len(original_polytope[0])-1:
+                raise Warning("Number of intersection points must be at least n-1")
+            # Extract points from the original polytope based on hyperplane values
+            poly1=np.vstack((original_polytope[hyperplane_val >= -Threshold],intersection_test))
+            poly2=np.vstack((original_polytope[hyperplane_val <= Threshold],intersection_test))
+            # poly1.append((original_polytope[hyperplane_val >= -1e-13]))
+            # poly2.append((original_polytope[hyperplane_val <= 1e-13]))
 
-    # # Add intersection points to both polytopes
-    # poly1.(np.array(intersection_points))
-    # poly2.extend(np.array(intersection_points))
-
+            # # Add intersection points to both polytopes
+            # poly1.(np.array(intersection_points))
+            # poly2.extend(np.array(intersection_points))
+    else:
+        poly1=(original_polytope[hyperplane_val >= -Threshold])
+        poly2=original_polytope[hyperplane_val <= Threshold]
     if len(poly1)<len(original_polytope[0])+1:
-        print("problem, number of vertices in poly1")
+        raise Warning("problem, number of vertices in poly1")
     if len(poly2)<len(original_polytope[0])+1:
-        print("problem, number of vertices in poly2")
+        raise Warning("problem, number of vertices in poly2")
     return [poly1, poly2]
 
 
@@ -159,15 +177,20 @@ def Enumerator_rapid(hyperplanes, b, original_polytope_test,TH,boundary_hyperpla
                 if n==2:
                     valid_side=[]
                     # If there is a sign variation, calculate the boundary hyperplanes
-                    boundary_hyperplane = ConvexHull(enumerate_poly[j]).equations
+                    # boundary_hyperplane = ConvexHull(enumerate_poly[j]).equations
                     side = []
                     # sides1,hyp_f=finding_side(np.array(boundary_hyperplanes[0]),enumerate_poly[j],np.array(border_bias[0]))
-                    sides = ConvexHull(enumerate_poly[j]).simplices
-                    # Iterate through the simplices of the polytope
-                    for m in range(len(sides)):
-                        if (hyperplane_val[j][sides[m][0]]) * (hyperplane_val[j][sides[m][1]]) < 0:
+                    # sides = ConvexHull(enumerate_poly[j]).simplices
+                    sides1,hyp_f=finding_side(np.array(boundary_hyperplanes[0]),enumerate_poly[j],np.array(border_bias[0]))
+                    for m in range(len(sides1)):
+                        if (hyperplane_val[j][sides1[m][0]]) * (hyperplane_val[j][sides1[m][1]]) < 0:
                             # If there's a change in sign along the simplex, consider it as a side
-                            side.append(boundary_hyperplane[m])
+                            side.append(hyp_f[m])
+                    # Iterate through the simplices of the polytope
+                    # for m in range(len(sides)):
+                    #     if (hyperplane_val[j][sides[m][0]]) * (hyperplane_val[j][sides[m][1]]) < 0:
+                    #         # If there's a change in sign along the simplex, consider it as a side
+                    #         side.append(boundary_hyperplane[m])
                     # Calculate the new polytopes using Polytope_formation
                     original_polytope_test = Polytope_formation(enumerate_poly[j], side, hyperplanes[i], b[i], hyperplane_val[j],TH)
                     ########################
@@ -308,10 +331,14 @@ def finding_valid_side(sides,hyperplane_val,n,hyp_f,hyperplanes,b,TH,parallel,si
     # intersections_test=check_valid_side(valid_side,sides,hyperplane_val,hyp_f,hyperplanes,b,n,TH,parallel,sign_m)
     # print("Duraion:",time.time()-st)
     # st=time.time()
-    intersections_test=check_valid_side(valid_side,sides,hyperplane_val,hyp_f,hyperplanes,b,n,TH,parallel,sign_m)
+    # intersections_test=check_valid_side(valid_side,sides,hyperplane_val,hyp_f,hyperplanes,b,n,TH,parallel,sign_m)
     # if len(intersections_test1)!=len(intersections_test):
     #     print("check")
     # print("Duraion1:",time.time()-st)
+    if len(valid_side)>0:
+        intersections_test=check_valid_side(valid_side,sides,hyperplane_val,hyp_f,hyperplanes,b,n,TH,parallel,sign_m)
+    else:
+        intersections_test=[]
     return intersections_test
 
 def check_valid_side(valid_side,sides,hyperplane_val,hyp_f,hyperplanes,b,n,TH,parallel,sign_m):
