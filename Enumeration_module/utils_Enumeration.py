@@ -107,7 +107,7 @@ def Enumerator_rapid(hyperplanes, b, original_polytope_test,TH,boundary_hyperpla
         # Iterate through the hyperplanes
     for i in range(len(hyperplanes)):
         signs=[]
-        # print("Hyperplane:",i)
+        # print("Neurons:",i)
         # if len(enumerate_poly)==0:
         #     # If it's the first iteration, initialize the enumerate_poly with a copy of the original polytope
 
@@ -363,7 +363,7 @@ def check_valid_side(valid_side,sides,hyperplane_val,hyp_f,hyperplanes,b,n,TH,pa
     # print("Len_new:",len1)
     # print("ln:",ln)
     #######################################################################################    
-    len_batch=2_00_000
+    len_batch=500_000
     batch=0
     # if ln>len_batch:
     #     batch=int(ln/len_batch)

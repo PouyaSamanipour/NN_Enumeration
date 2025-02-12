@@ -75,7 +75,7 @@ def enumeration_function(NN_file,name_file,TH,mode,parallel):
     st_enum=time.time()
     for i in range(int(num_hidden_layers)):
         for j in range(len(enumerate_poly)):
-            # print("Layer=",i,"Cell=/Number of cells=",j,"/",len(enumerate_poly))
+            print("Layer=",i,"Cell=/Number of cells=",j,"/",len(enumerate_poly))
             if mode=="Low_Ram":
                 enumerate_poly,border_hyperplane,border_bias=Enumerator(hyperplanes[i],b[i],original_polytope_test,TH,[border_hyperplane],[border_bias],csv_file,D,i,enumerate_poly,hyperplanes)
             else:
