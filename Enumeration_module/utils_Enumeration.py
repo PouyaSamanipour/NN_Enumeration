@@ -12,7 +12,7 @@ from numpy.linalg import matrix_rank
 from numpy.linalg import inv
 from numba import prange
 import torch
-import cdd
+# import cdd
 import math
 def Polytope_formation(original_polytope, boundary_hyperplane, hyperplanes, b, hyperplane_val,Th):
     # Initialize empty lists to store the two polytopes
@@ -1122,43 +1122,43 @@ def GPU_Intersection(intersection_n,boundary_hyperplanes,border_bias,signs):
 
 
 
-def compute_polytope_vertices(
-    A: np.ndarray, b: np.ndarray
-) -> list[np.ndarray]:
-    r"""Compute the vertices of a polytope.
+# def compute_polytope_vertices(
+#     A: np.ndarray, b: np.ndarray
+# ) -> list[np.ndarray]:
+#     r"""Compute the vertices of a polytope.
 
-    The polytope is given in halfspace representation by :math:`A x \leq b`.
+#     The polytope is given in halfspace representation by :math:`A x \leq b`.
 
-    Parameters
-    ----------
-    A :
-        Matrix of halfspace representation.
-    b :
-        Vector of halfspace representation.
+#     Parameters
+#     ----------
+#     A :
+#         Matrix of halfspace representation.
+#     b :
+#         Vector of halfspace representation.
 
-    Returns
-    -------
-    :
-        List of polytope vertices.
+#     Returns
+#     -------
+#     :
+#         List of polytope vertices.
 
-    Notes
-    -----
-    This method won't work well if your halfspace representation includes
-    equality constraints :math:`A x = b` written as :math:`(A x \leq b \wedge
-    -A x \leq -b)`. If this is your use case, consider using directly the
-    linear set ``lin_set`` of `equality-constraint generatorsin pycddlib
-    <https://pycddlib.readthedocs.io/en/latest/matrix.html>`_.
-    """
-    b = b.reshape((b.shape[0], 1))
-    mat = cdd.Matrix(np.hstack([b, -A]), number_type="float")
-    mat.rep_type = cdd.RepType.INEQUALITY
-    P = cdd.Polyhedron(mat)
-    g = P.get_generators()
-    V = np.array(g)
-    vertices = []
-    for i in range(V.shape[0]):
-        if V[i, 0] != 1:  # 1 = vertex, 0 = ray
-            raise ValueError("Polyhedron is not a polytope")
-        elif i not in g.lin_set:
-            vertices.append(V[i, 1:])
-    return vertices
+#     Notes
+#     -----
+#     This method won't work well if your halfspace representation includes
+#     equality constraints :math:`A x = b` written as :math:`(A x \leq b \wedge
+#     -A x \leq -b)`. If this is your use case, consider using directly the
+#     linear set ``lin_set`` of `equality-constraint generatorsin pycddlib
+#     <https://pycddlib.readthedocs.io/en/latest/matrix.html>`_.
+#     """
+#     b = b.reshape((b.shape[0], 1))
+#     mat = cdd.Matrix(np.hstack([b, -A]), number_type="float")
+#     mat.rep_type = cdd.RepType.INEQUALITY
+#     P = cdd.Polyhedron(mat)
+#     g = P.get_generators()
+#     V = np.array(g)
+#     vertices = []
+#     for i in range(V.shape[0]):
+#         if V[i, 0] != 1:  # 1 = vertex, 0 = ray
+#             raise ValueError("Polyhedron is not a polytope")
+#         elif i not in g.lin_set:
+#             vertices.append(V[i, 1:])
+#     return vertices

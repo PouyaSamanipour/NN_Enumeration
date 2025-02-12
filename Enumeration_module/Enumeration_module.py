@@ -13,7 +13,7 @@ import torch
 import pickle
 
 def enumeration_function(NN_file,name_file,TH,mode,parallel): 
-    model = torch.jit.load(NN_file)
+    model = torch.jit.load(NN_file,map_location=torch.device('cpu'))
     #knowing number of neurons in each layer
     cntr=0
     params=[]
@@ -75,7 +75,8 @@ def enumeration_function(NN_file,name_file,TH,mode,parallel):
     st_enum=time.time()
     for i in range(int(num_hidden_layers)):
         for j in range(len(enumerate_poly)):
-            print("Layer=",i,"Cell=/Number of cells=",j,"/",len(enumerate_poly))
+            if j%1000==0:
+                print("Layer=",i,"Cell=/Number of cells=",j,"/",len(enumerate_poly))
             if mode=="Low_Ram":
                 enumerate_poly,border_hyperplane,border_bias=Enumerator(hyperplanes[i],b[i],original_polytope_test,TH,[border_hyperplane],[border_bias],csv_file,D,i,enumerate_poly,hyperplanes)
             else:
@@ -100,7 +101,7 @@ def enumeration_function(NN_file,name_file,TH,mode,parallel):
 
     end_process=time.time()
     print("Accumulative enumeration time=\n",enumeration_time)
-    print("Number of hyperplanes:\n",n_h)
+    print("Number of hyperplanes:\n",[len(hyperplanes[k]) for k in num_hidden_layers])
     print("Number of cells:\n",len(enumerate_poly))        
     # plot_polytope_2D(NN_file,TH)
     D_raw=Finding_cell_id(enumerate_poly,hyperplanes,b,num_hidden_layers)
