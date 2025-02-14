@@ -10,9 +10,10 @@ if __name__=='__main__':
         # NN_file="NN_files/test_simple_6d_40.xlsx"
         # NN_file="NN_files/Path_following_20.xlsx"
     # NN_file="NN_files/model_IP_Pedram_test_deep.pt"
-    NN_file="NN_files/model_6d_20_20_deep.pt"
+    NN_file="NN_files/model_IP_Pedram_test_deep.pt"
     eps1=0.001
     eps2=0.01
-    name="model_6d_deep"
-    TH=[3.0,3.0,3.0,3.0,3.0,3.0]
+    name="model_8d_deep"
+    TH=[3.14,3.14]
+    
     enumeration_function(NN_file,name,TH,mode,parallel)

@@ -95,18 +95,23 @@ def enumeration_function(NN_file,name_file,TH,mode,parallel):
         Enum=[]
     D=[]
     enumeration_time=enumeration_time+(end_enum-st_enum)
-    with open(name_file+"_polytope.pkl", "wb") as f:
-        pickle.dump(enumerate_poly, f)
-
-
     end_process=time.time()
     print("Accumulative enumeration time=\n",enumeration_time)
-    print("Number of hyperplanes:\n",[len(hyperplanes[k]) for k in num_hidden_layers])
+    print("Number of hyperplanes:\n",[len(hyperplanes[k]) for k in range(int(num_hidden_layers))])
     print("Number of cells:\n",len(enumerate_poly))        
     # plot_polytope_2D(NN_file,TH)
+    with open(name_file+"_polytope.pkl", "wb") as f:
+        pickle.dump(enumerate_poly, f)
     D_raw=Finding_cell_id(enumerate_poly,hyperplanes,b,num_hidden_layers)
     with open(name_file+"_cell_id.pkl", "wb") as f:
         pickle.dump(D_raw, f)
+    ### checking vertices
+    vert1=enumerate_poly[60][2]
+    z=np.dot(hyperplanes[0],vert1)+b[0]
+    a=np.maximum(0,z)
+    z2=np.dot(hyperplanes[1],a)+b[1]
+
+
     if n==2:
         plot_polytope(enumerate_poly,"test")   
 

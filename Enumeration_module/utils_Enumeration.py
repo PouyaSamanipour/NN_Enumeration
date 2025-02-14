@@ -396,7 +396,7 @@ def check_valid_side(valid_side,sides,hyperplane_val,hyp_f,hyperplanes,b,n,TH,pa
         list_final.extend(list1)
         if parallel:    
             if len(list_final)>=len_batch or j==len(lst_new)-1:
-                if len(list_final)>=10000:
+                if len(list_final)>=50000:
                     st=time.time()
                     valid_combination=check_combination_parallel(TH,np.array(list_final),n,sides,hyperplane_val,np.array(hyp_f),hyperplanes,b,sign_m)                    
                     del list_final

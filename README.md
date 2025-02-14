@@ -79,7 +79,8 @@ Below is an example of the enumeration results, showing the number of **hyperpla
 
 | Example       | Hyperplanes   | Cells      | Time (s)     |
 |--------------|--------------|------------|-------------|
-| 6D System    | 20-20        | 26,733     | 46          |
+| 6D System    | (20,20)      | 26,733     | 46          |
+| 8D           |(15,15,15)    |9638| 600
 
 <!-- ---
 
