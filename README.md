@@ -89,11 +89,6 @@ CHANGELOG.md
 README.md
 ```
 
-## Citation
-
-If you use this code in academic work, please cite:
-
-> P. Shahvali, "Exact Enumeration of Polytopic Linear Regions of ReLU Neural Networks via Bitwise Vertex-Adjacency Testing," *Proc. IEEE Conference on Decision and Control (CDC)*, 2025.
 
 ## License
 

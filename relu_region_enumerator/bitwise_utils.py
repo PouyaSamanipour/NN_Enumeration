@@ -725,3 +725,23 @@ class HybridRaggedStorage:
 
     def __getitem__(self, idx):
         return self.get_polytope(idx)
+
+
+
+def finding_deep_hype(hyperplanes,b,S_prime,border_hyperplane,border_bias,i,n):
+    S_init=np.eye(np.shape(hyperplanes[0])[0])
+    hype=S_init@hyperplanes[0]
+    bias=(S_init@b[0])
+
+    # border_hyperplane=np.vstack((border_hyperplane,hyperplanes[0]))
+    # border_bias=border_bias+b[0].tolist()
+    m=2*n
+    for j in range(0,i):
+        border_hyperplane=np.vstack((border_hyperplane,hype))
+        border_bias=np.hstack((np.array(border_bias),bias))
+        mid_point=np.mean(S_prime,axis=0)
+        S=np.sign(np.maximum(border_hyperplane@mid_point+border_bias,0))
+        hype=hyperplanes[j+1]@np.diag(S[m:])@hype    
+        bias=hyperplanes[j+1]@np.diag(S[m:])@bias+b[j+1]
+        m=m+(np.shape(hyperplanes[j])[0])
+    return hype,bias,border_hyperplane,border_bias.tolist()

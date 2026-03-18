@@ -33,7 +33,7 @@ import h5py
 import numpy as np
 import torch
 
-from .bitwise_utils import Enumerator_rapid
+from .bitwise_utils import Enumerator_rapid, finding_deep_hype
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +246,6 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel):
             else:
                 # Deeper layers: propagate accumulated boundary hyperplanes
                 # for the current cell through the previous layers.
-                from .deep_utils import finding_deep_hype  # lazy import
                 hype1, bias1, border_hyperplane1, border_bias1 = finding_deep_hype(
                     hyperplanes, b,
                     enumerate_poly[j],
