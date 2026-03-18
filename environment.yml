@@ -1,0 +1,30 @@
+name: relu_enum
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python — must stay within 3.8–3.11 for numba + torch compatibility
+  - python=3.10
+
+  # Core numerical stack (conda for reliable binary linking)
+  - numpy>=1.24
+  - scipy>=1.10
+  - matplotlib>=3.7
+  - h5py>=3.8
+
+  # Numba — install via conda-forge for correct LLVM linkage on Windows
+  - conda-forge::numba>=0.57
+
+  # PyTorch CPU-only (change to pytorch-cuda if you want GPU support)
+  - pytorch::pytorch>=2.0
+  - pytorch::torchvision
+  - pytorch::cpuonly
+
+  # Pip-only packages
+  - pip
+  - pip:
+      - snakeviz>=2.2        # profiling visualiser
+      - memory_profiler>=0.61
+      - pytest>=7.4

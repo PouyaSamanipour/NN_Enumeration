@@ -14,19 +14,25 @@ This package replaces LP-feasibility adjacency checks — which cost O(n³) per 
 
 ## Installation
 
-**From GitHub (recommended):**
-```bash
-pip install git+https://github.com/PouyaSamanipour/NN_Enumeration.git
-```
-
-**Editable install for development:**
+**Step 1 — Clone the repo:**
 ```bash
 git clone https://github.com/PouyaSamanipour/NN_Enumeration.git
 cd NN_Enumeration
+```
+
+**Step 2 — Create and activate the conda environment:**
+```bash
+conda env create -f environment.yml
+conda activate relu_enum
+```
+
+**Step 3 — Install the package in editable mode:**
+```bash
 pip install -e .
 ```
 
-**Dependencies:** `numpy>=1.24`, `numba>=0.57`, `scipy>=1.10`, `torch>=2.0`, `h5py>=3.8`, `matplotlib>=3.7`.
+> **Why conda?** Numba requires a specific LLVM version that conda resolves automatically. Using plain pip on Windows can produce LLVM linkage errors.
+
 Compatible with Python 3.8–3.11.
 
 ## Quick start
