@@ -1,98 +1,94 @@
-# **Vertex-based Enumeration Algorithm for ReLU NNs**
+# ReLU Region Enumerator
 
-This package provides an **enumeration algorithm** that computes the partitioning of the input space induced by a **Deep ReLU Neural Network (ReLU NN)**. The algorithm extracts **neurons or hyperplanes** from the network and efficiently enumerates the corresponding cells in the partition.
+[![Python](https://img.shields.io/badge/python-3.8--3.11-blue)](https://www.python.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![GitHub](https://img.shields.io/badge/GitHub-PouyaSamanipour%2FNN__Enumeration-lightgrey?logo=github)](https://github.com/PouyaSamanipour/NN_Enumeration)
 
----
+Exact and complete enumeration of the polytopic linear regions of feedforward ReLU neural networks, using a vertex-based algorithm with bitwise edge-adjacency testing.
 
-## **Installation**
-To install this package, first, clone the repository and navigate to the package directory:
+## Overview
 
-```sh
+A ReLU network partitions its input domain into a finite number of convex polytopes, on each of which the network is an affine function. Enumerating these regions exactly is useful for Lyapunov stability verification, barrier certificate computation, and formal safety analysis of neural-network control policies.
+
+This package replaces LP-feasibility adjacency checks — which cost O(n³) per vertex pair — with a single bitwise AND plus a popcount, reducing per-edge cost to O(1). Each polytope vertex carries a bitmask encoding which accumulated boundary hyperplanes it lies on; two vertices share an edge if and only if their AND has at least (n−1) bits set, as guaranteed by the combinatorial structure of simple polytopes (Ziegler, *Lectures on Polytopes*, 1995).
+
+## Installation
+
+**From GitHub (recommended):**
+```bash
+pip install git+https://github.com/PouyaSamanipour/NN_Enumeration.git
+```
+
+**Editable install for development:**
+```bash
 git clone https://github.com/PouyaSamanipour/NN_Enumeration.git
 cd NN_Enumeration
-```
-<!-- This will install the package in **editable mode**, allowing you to modify the code without reinstalling. -->
-
-<!-- Alternatively, if the package is published on PyPI, install it directly with:
-
-```sh
-pip install Enumeration_module
+pip install -e .
 ```
 
---- -->
+**Dependencies:** `numpy>=1.24`, `numba>=0.57`, `scipy>=1.10`, `torch>=2.0`, `h5py>=3.8`, `matplotlib>=3.7`.
+Compatible with Python 3.8–3.11.
 
-## **Dependencies**
-The package requires the following dependencies, which will be installed automatically with 
-``` sh
-python3 -m venv myenv
-source myenv/bin/activate
-pip install -r requirement.txt
-```
-- `numpy`
-- `numba`
-- `torch`
-- `scipy`
-- `matplotlib`
-- `pycddlib`
-- `pandas` (for CSV handling)
-- `torch`
-
-If not installed automatically, you can manually install them using:
-
-```sh
-pip install numpy numba torch scipy matplotlib cddlib pandas
-```
-
----
-
-## **How to Use**
-### **1. Running the Enumeration Algorithm**
-To run the enumeration algorithm using a saved **single hidden-layer ReLU neural network**, execute:
-
-```sh
-python3 script.py
-```
-
-### **2. Specifying the Neural Network File**
-Inside `script.py`, specify the **path to the trained ReLU NN** stored in a `.pt` file. The network is assumed to follow the form:
-
-$\dot{x} = W\sigma(Hx + b) + c $
-
-In this file, $TH$ is the threshold of the domain that we cosidered enymeration. Our domain in this version is defined as:
-
-$\mathcal D=\{x\in \mathbb R^n:|x|_\infty\leq TH\}$. 
-
-**"Note: It is recommended to set `parallel=True` in complex examples."**  
-
-Modify the `NN_file` variable in `script.py` to point to the desired **Neural Network file**:
+## Quick start
 
 ```python
-NN_file = "path/to/NN_file.pt"
+from relu_region_enumerator import enumeration_function
+
+enumeration_function(
+    NN_file="NN_files/Arch3_2_96.pt",   # TorchScript model
+    name_file="arch3_result",            # output file base name
+    TH=[3.0, 3.0],                       # per-dimension domain half-widths
+    mode="Rapid_mode",
+    parallel=True,
+)
 ```
-It outputs two types of pickle files:
 
-- Polytopes: A collection of vertices for each polytope in the activation space.
-- Cell ID: Information about which neurons (ReLU units) are active in each layer for each enumerated polytope.
+Or run the provided script:
 
-## **Example Results**
-Below is an example of the enumeration results, showing the number of **hyperplanes, computed cells, and execution time** for different neural network models.
+```bash
+python run.py
+```
 
-| Example       | Hyperplanes   | Cells      | Time (s)     |
-|--------------|--------------|------------|-------------|
-| 6D System    | (20,20)      | 26,733     | 46          |
-| 8D           |(15,15,15)    |9638| 600
+Profiling statistics are written to `profiling.prof`.
 
-<!-- ---
+## Output
 
-## **Future Work**
-- Extending the enumeration algorithm to **deep ReLU networks**.
-- Improving efficiency using **parallel computation**.
-- Adding support for **more complex dynamical systems**.
+- **`<name_file>_polytope.h5`** — HDF5 file with datasets:
+  - `offsets` — integer array of shape `(N+1,)`; region k occupies rows `offsets[k]:offsets[k+1]`.
+  - `vertices` — float64 array of shape `(total_vertices, n)`.
 
---- -->
+## Model format
 
-## **License**
-This package is released under the **MIT License**.
+The model must be saved with `torch.jit.save` (TorchScript). The architecture must be a fully-connected ReLU network: alternating `nn.Linear` and `nn.ReLU` layers, with a final linear output layer (no trailing ReLU).
 
-For any questions or contributions, feel free to contact **Pouya Samanipour** at **psa254@uky.edu**.
+## High-dimensional mode
 
+For input dimension n > 5, intermediate per-layer polytope lists are streamed through HDF5 scratch files in `layer_tmp/` to stay within RAM. The scratch files are deleted after each layer.
+
+## Repository structure
+
+```
+relu_region_enumerator/
+    __init__.py          — public API exports
+    bitwise_utils.py     — bitmask generation, slicing, storage primitives
+    core.py              — top-level enumeration pipeline
+    visualization.py     — partition plots, barrier certificate 3-D view, Lyapunov overlays
+legacy/                  — original scripts prior to packaging (preserved for reference)
+run.py                   — command-line entry point with profiling
+requirements.txt         — runtime dependencies
+requirements-dev.txt     — development dependencies
+pyproject.toml           — package metadata
+LICENSE
+CHANGELOG.md
+README.md
+```
+
+## Citation
+
+If you use this code in academic work, please cite:
+
+> P. Shahvali, "Exact Enumeration of Polytopic Linear Regions of ReLU Neural Networks via Bitwise Vertex-Adjacency Testing," *Proc. IEEE Conference on Decision and Control (CDC)*, 2025.
+
+## License
+
+MIT © Pouya Samanipour
