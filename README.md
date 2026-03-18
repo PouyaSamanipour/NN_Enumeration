@@ -37,29 +37,57 @@ Compatible with Python 3.8–3.11.
 
 ## Quick start
 
+Run any of the four paper benchmarks directly from the command line:
+
+```bash
+# Arch3 — 2D input, two hidden layers of 96 neurons
+python run.py --model NN_files/Arch3_2_96.pt --th 3.0 3.0 --output arch3
+
+# Decay — 6D input, two hidden layers of 12 neurons
+python run.py --model NN_files/Decay_6d_12_12.pt --th 3.0 3.0 3.0 3.0 3.0 3.0 --output decay
+
+# Spacecraft — 6D input, three hidden layers of 16 neurons
+python run.py --model NN_files/model_satellite_6d_16_16.pt --th 1.5 1.5 1.5 1.5 1.5 1.5 --output spacecraft
+
+# Quadrotor — 12D input, two hidden layers of 15 neurons
+    python run.py --model NN_files/model_quadrotor_modified.pt --th 1.0 1.0 1.0 0.3 0.3 0.3 1.0 1.0 1.0 1.0 1.0 1.0 --output quadrotor
+```
+
+Add `--profile` to any command to save cProfile statistics:
+
+```bash
+python run.py --model NN_files/Arch3_2_96.pt --th 3.0 3.0 --output arch3 --profile
+snakeviz arch3.prof
+```
+
+Or use the Python API directly:
+
 ```python
 from relu_region_enumerator import enumeration_function
 
 enumeration_function(
-    NN_file="NN_files/Arch3_2_96.pt",   # TorchScript model
-    name_file="arch3_result",            # output file base name
-    TH=[3.0, 3.0],                       # per-dimension domain half-widths
+    NN_file="NN_files/Arch3_2_96.pt",
+    name_file="arch3_result",
+    TH=[3.0, 3.0],
     mode="Rapid_mode",
     parallel=True,
 )
 ```
 
-Or run the provided script:
+All available options:
 
-```bash
-python run.py
-```
-
-Profiling statistics are written to `profiling.prof`.
+| Argument | Description | Default |
+|---|---|---|
+| `--model` / `-m` | Path to TorchScript `.pt` file | required |
+| `--th` | Per-dimension domain half-widths | required |
+| `--output` / `-o` | Base name for output files | `result` |
+| `--mode` | `Rapid_mode` or `Low_Ram` | `Rapid_mode` |
+| `--no-parallel` | Disable parallel JIT slicer | off |
+| `--profile` | Save cProfile data to `<output>.prof` | off |
 
 ## Output
 
-- **`<name_file>_polytope.h5`** — HDF5 file with datasets:
+- **`<output>_polytope.h5`** — HDF5 file with datasets:
   - `offsets` — integer array of shape `(N+1,)`; region k occupies rows `offsets[k]:offsets[k+1]`.
   - `vertices` — float64 array of shape `(total_vertices, n)`.
 
@@ -80,7 +108,7 @@ relu_region_enumerator/
     core.py              — top-level enumeration pipeline
     visualization.py     — partition plots, barrier certificate 3-D view, Lyapunov overlays
 legacy/                  — original scripts prior to packaging (preserved for reference)
-run.py                   — command-line entry point with profiling
+run.py                   — command-line entry point with argparse and profiling
 requirements.txt         — runtime dependencies
 requirements-dev.txt     — development dependencies
 pyproject.toml           — package metadata
