@@ -1,0 +1,8 @@
+numpy
+numba
+torch
+scipy
+matplotlib
+pandas  # For CSV handling
+torch
+#pycddlib

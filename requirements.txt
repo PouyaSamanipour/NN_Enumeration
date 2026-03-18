@@ -1,0 +1,10 @@
+# Core runtime dependencies
+# Pin minimum versions that are known to work; upper bounds are intentionally
+# omitted to avoid unnecessary conflicts in downstream environments.
+
+numpy>=1.24
+numba>=0.57
+scipy>=1.10
+torch>=2.0
+h5py>=3.8
+matplotlib>=3.7
