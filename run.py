@@ -11,16 +11,21 @@ Usage
 
     # Enumeration + barrier certificate boundary cell extraction
     python run.py --model NN_files/Arch3_2_96.pt --th 3.0 3.0 --output arch3 --verification barrier --barrier-model NN_files/Arch3_2_96.pt
+    python run.py --model NN_files/model_satellite_6d_16_16.pt --th 1.5 1.5 1.5 1.5 1.5 1.5 --output spacecraft --verification barrier --barrier-model NN_files/model_satellite_6d_16_16.pt
+    python run.py --model NN_files/model_complex_3d_64_64.pt --th 3.0 3.0 3.0 --output Complex --verification barrier --barrier-model NN_files/model_complex_3d_64_64.pt
+    python run.py --model NN_files/Decay_6d_12_12.pt --th 3.0 3.0 3.0 3.0 3.0 3.0 --output decay  --verification barrier --barrier-model NN_files/Decay_6d_12_12.pt
 
     # With profiling
     python run.py --model NN_files/Arch3_2_96.pt --th 3.0 3.0 --profile
+    # Debugging
+        python -m pdb run.py --model NN_files/Arch3_2_96.pt --th 3.0 3.0
 
 Paper benchmarks
 ----------------
     python run.py --model NN_files/Arch3_2_96.pt --th 3.0 3.0 --output arch3
-    python run.py --model NN_files/Decay_6d_12_12.pt --th 3y.0 3.0 3.0 3.0 3.0 3.0 --output decay
-    python run.py --model NN_files/spacecraft.pt --th 3.0 3.0 3.0 3.0 3.0 3.0 --output spacecraft
-    python run.py --model NN_files/quadrotor.pt --th 3.0 3.0 3.0 3.0 3.0 3.0 3.0 3.0 3.0 3.0 3.0 3.0 --output quadrotor
+    python run.py --model NN_files/Decay_6d_12_12.pt --th 3.0 3.0 3.0 3.0 3.0 3.0 --output decay
+    python run.py --model NN_files/model_satellite_6d_16_16.pt --th 1.5 1.5 1.5 1.5 1.5 1.5 --output spacecraft
+    python run.py --model NN_files/model_quadrotor_lyapunov.pt --th 1.0 1.0 1.0 0.3 0.3 0.3 1.0 1.0 1.0 1.0 1.0 1.0 --output quadrotor
 """
 
 import argparse
