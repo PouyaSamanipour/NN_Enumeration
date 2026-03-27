@@ -1058,3 +1058,531 @@ def finding_deep_hype(hyperplanes,b,S_prime,border_hyperplane,border_bias,i,n):
         bias=hyperplanes[j+1]@np.diag(S[m:])@bias+b[j+1]
         m=m+(np.shape(hyperplanes[j])[0])
     return hype,bias,border_hyperplane,border_bias.tolist()
+
+
+
+# """
+# bitwise_utils_numpy.py
+# ======================
+
+# Pure-NumPy version of bitwise_utils.py — identical logic, zero Numba.
+
+# Use this to benchmark how much Numba contributes on top of the core
+# algorithmic speedup (LP removal). The only changes from the Numba version
+# are:
+
+#   - All @njit / @njit(parallel=True) decorators removed.
+#   - prange(...) replaced with range(...).
+#   - np.uint64 scalar arithmetic replaced with Python int where Numba
+#     required explicit casts that NumPy handles natively.
+#   - Wide-mask functions left as plain Python loops over numpy arrays.
+#   - Everything else is bit-for-bit identical to bitwise_utils.py.
+# """
+
+# import os
+# import tempfile
+
+# import numpy as np
+
+
+# # ---------------------------------------------------------------------------
+# # Bitmask generation
+# # ---------------------------------------------------------------------------
+
+# def generate_mask(vertices, hyperplanes, b, tolerance=1e-7):
+#     """Compute a hyperplane-incidence bitmask for each vertex.
+
+#     A bit h is set in the mask for vertex v if |hyperplanes[h] · v + b[h]|
+#     <= tolerance, meaning v lies (numerically) on the h-th hyperplane.
+
+#     Parameters
+#     ----------
+#     vertices   : (V, n) float64 array
+#     hyperplanes: (H, n) float64 array
+#     b          : (H,)   float64 array
+#     tolerance  : float
+
+#     Returns
+#     -------
+#     masks : (V,) int64 array  -- bitmask per vertex (Python int, no uint64 overflow).
+#     """
+#     n_verts  = vertices.shape[0]
+#     n_planes = hyperplanes.shape[0]
+#     masks = np.zeros(n_verts, dtype=np.int64)
+
+#     # Compute all signed distances at once: (V, H)
+#     vals = vertices @ hyperplanes.T + b  # shape (V, H)
+#     on_plane = np.abs(vals) <= tolerance  # shape (V, H) bool
+
+#     for h in range(n_planes):
+#         masks[on_plane[:, h]] |= (1 << h)
+
+#     return masks
+
+
+# # ---------------------------------------------------------------------------
+# # Polytope slicing — serial pure-NumPy version
+# # ---------------------------------------------------------------------------
+
+# def slice_polytope_with_hyperplane(enumerate_poly, hyperplane_val, masks, i, n):
+#     """Slice a polytope with a ReLU hyperplane using bitmask edge adjacency.
+
+#     Parameters
+#     ----------
+#     enumerate_poly : (V, n) float64 array
+#     hyperplane_val : (V,)   float64 array
+#     masks          : (V,)   int64 array
+#     i              : int -- global index of the current ReLU hyperplane
+#     n              : int -- input dimension
+
+#     Returns
+#     -------
+#     polytopes     : list of two (V_k, n) arrays -- [inside, outside]
+#     mask_lists    : list of two (V_k,) int64 arrays
+#     created_verts : (E, n) float64 array
+#     """
+#     req_shared = n - 1
+
+#     strict_index_in  = np.where(hyperplane_val < -1e-9)[0]
+#     strict_index_out = np.where(hyperplane_val >  1e-9)[0]
+#     index_in  = np.where(hyperplane_val <= 1e-5)[0]
+#     index_out = np.where(hyperplane_val >= -1e-5)[0]
+
+#     max_new = len(index_in) * len(index_out)
+#     new_verts_buffer = np.zeros((max_new, n), dtype=np.float64)
+#     new_masks_buffer = np.zeros(max_new,      dtype=np.int64)
+
+#     count = 0
+#     for k in range(len(strict_index_in)):
+#         u_idx  = strict_index_in[k]
+#         mask_u = int(masks[u_idx])
+
+#         for l in range(len(strict_index_out)):
+#             v_idx = strict_index_out[l]
+
+#             if hyperplane_val[u_idx] < -1e-9 and hyperplane_val[v_idx] > 1e-9:
+#                 mask_v      = int(masks[v_idx])
+#                 shared_mask = mask_u & mask_v
+
+#                 # Kernighan popcount with early exit.
+#                 n_shared = 0
+#                 temp = shared_mask
+#                 while temp > 0 and n_shared < req_shared:
+#                     temp &= temp - 1
+#                     n_shared += 1
+
+#                 if n_shared >= req_shared:
+#                     d1 = hyperplane_val[u_idx]
+#                     d2 = hyperplane_val[v_idx]
+#                     t  = -d1 / (d2 - d1)
+#                     new_verts_buffer[count] = (
+#                         enumerate_poly[u_idx]
+#                         + t * (enumerate_poly[v_idx] - enumerate_poly[u_idx])
+#                     )
+#                     new_masks_buffer[count] = shared_mask | (mask_u & (1 << i))
+#                     count += 1
+
+#     created_verts = new_verts_buffer[:count]
+#     created_masks = new_masks_buffer[:count]
+
+#     verts_in  = np.vstack((enumerate_poly[index_in],  created_verts))
+#     masks_in  = np.concatenate((masks[index_in],  created_masks))
+#     verts_out = np.vstack((enumerate_poly[index_out], created_verts))
+#     masks_out = np.concatenate((masks[index_out], created_masks))
+
+#     return [verts_in, verts_out], [masks_in, masks_out], created_verts
+
+
+# # Alias: the Numba version had a jit fallback with slightly different tolerance
+# # handling. Here both are the same function since there is no JIT overhead.
+# slice_polytope_with_hyperplane_jit = slice_polytope_with_hyperplane
+
+
+# # ---------------------------------------------------------------------------
+# # Polytope slicing — "parallel" version (serial in pure NumPy)
+# # ---------------------------------------------------------------------------
+
+# def slice_polytope_parallel(enumerate_poly, hyperplane_val, masks, i, n):
+#     """Serial fallback for the parallel JIT slicer.
+
+#     In the Numba version this used prange for parallelism. Here it is
+#     identical to slice_polytope_with_hyperplane — included so the caller
+#     (Enumerator_rapid) needs no changes.
+#     """
+#     return slice_polytope_with_hyperplane(enumerate_poly, hyperplane_val, masks, i, n)
+
+
+# # ---------------------------------------------------------------------------
+# # Child-polytope assembly  (unchanged from Numba version)
+# # ---------------------------------------------------------------------------
+
+# def Polytope_formation_hd(original_polytope, hyperplane_val, Th, intersection_test, polytops_test):
+#     """Assemble the two child polytopes produced by slicing."""
+#     n = len(original_polytope[0])
+
+#     if len(intersection_test) < n - 1:
+#         raise Warning(
+#             f"Number of intersection points ({len(intersection_test)}) "
+#             f"must be at least {n - 1}."
+#         )
+
+#     poly1 = np.vstack((original_polytope[hyperplane_val >= -1e-13], intersection_test))
+#     poly2 = np.vstack((original_polytope[hyperplane_val <=  1e-13], intersection_test))
+
+#     if len(poly1) < n + 1:
+#         print("Warning: poly1 may have too few vertices for a full-dimensional polytope.")
+#     if len(poly2) < n + 1:
+#         print("Warning: poly2 may have too few vertices for a full-dimensional polytope.")
+
+#     return [poly1, poly2]
+
+
+# # ---------------------------------------------------------------------------
+# # Layer-level enumerator  (unchanged logic from Numba version)
+# # ---------------------------------------------------------------------------
+
+# def Enumerator_rapid(
+#     hyperplanes,
+#     b,
+#     original_polytope_test,
+#     TH,
+#     boundary_hyperplanes,
+#     border_bias,
+#     parallel,
+#     D,
+#     m,
+#     use_wide=False,
+# ):
+#     """Enumerate all linear regions produced by one layer of ReLU hyperplanes.
+
+#     Identical to the Numba version; dispatcher thresholds kept the same so
+#     timing comparisons are apple-to-apple.
+#     """
+#     enumerate_poly = list(original_polytope_test)
+
+#     for i in range(len(hyperplanes)):
+#         intact_poly = []
+#         poly_dummy  = []
+#         n = len(enumerate_poly[0][0])
+
+#         # Sign-variation screening.
+#         sgn_var = []
+#         for k in enumerate_poly:
+#             dum = np.dot(k, hyperplanes[i].T) + b[i]
+#             if np.min(dum) < -1e-5 and np.max(dum) > 1e-5:
+#                 sgn_var.append(np.max(dum) * np.min(dum))
+#             else:
+#                 sgn_var.append(0.0)
+
+#         global_bit_index = i + len(boundary_hyperplanes[0])
+
+#         # Total bits needed = all boundary hyperplanes accumulated so far
+#         # PLUS all remaining neurons in this layer (including the current one).
+#         # This ensures the mask array is wide enough for every bit index that
+#         # _wide_mask_or_and will ever write during this Enumerator_rapid call.
+#         total_bits_needed = len(boundary_hyperplanes[0]) + len(hyperplanes)
+#         num_words_needed  = (total_bits_needed + 63) // 64
+
+#         for j in range(len(enumerate_poly)):
+#             if sgn_var[j] < -1e-9:
+#                 hyperplane_val = np.dot(enumerate_poly[j], hyperplanes[i].T) + b[i]
+#                 verts = np.array(enumerate_poly[j])
+#                 bh    = np.array(boundary_hyperplanes[0])
+#                 bb    = np.array(border_bias[0])
+
+#                 if use_wide:
+#                     masks_w = generate_mask_wide(
+#                         verts, bh, bb, tolerance=1e-10, num_words=num_words_needed
+#                     )
+#                     polytops_test, _, created_verts = slice_polytope_wide(
+#                         verts, np.array(hyperplane_val), masks_w, global_bit_index, n,
+#                     )
+#                 else:
+#                     masks = generate_mask(verts, bh, bb, tolerance=1e-10)
+#                     # Keep the same dispatch threshold as the Numba version.
+#                     if len(masks) < 1000:
+#                         polytops_test, _, created_verts = slice_polytope_with_hyperplane(
+#                             verts, np.array(hyperplane_val), masks, global_bit_index, n,
+#                         )
+#                     else:
+#                         polytops_test, _, created_verts = slice_polytope_parallel(
+#                             verts, np.array(hyperplane_val), masks, global_bit_index, n,
+#                         )
+
+#                     # Fallback (same condition as Numba version).
+#                     if len(created_verts) <= n - 1:
+#                         polytops_test, _, created_verts = slice_polytope_with_hyperplane_jit(
+#                             verts, np.array(hyperplane_val), masks, global_bit_index, n,
+#                         )
+
+#                 if len(created_verts) > n - 1:
+#                     result = Polytope_formation_hd(
+#                         enumerate_poly[j],
+#                         np.array(hyperplane_val),
+#                         TH,
+#                         np.array(created_verts),
+#                         polytops_test,
+#                     )
+#                 else:
+#                     result = [enumerate_poly[j]]
+
+#                 poly_dummy.extend(result)
+#             else:
+#                 intact_poly.append(enumerate_poly[j])
+
+#         intact_poly.extend(poly_dummy)
+#         boundary_hyperplanes[0] = np.vstack(
+#             (boundary_hyperplanes[0], hyperplanes[i])
+#         ).tolist()
+#         border_bias[0] = border_bias[0] + [b[i]]
+#         enumerate_poly = intact_poly
+
+#     return enumerate_poly
+
+
+# # ---------------------------------------------------------------------------
+# # Wide-mask primitives  (> 64 hyperplanes)
+# # ---------------------------------------------------------------------------
+
+# def generate_mask_wide(vertices, hyperplanes, b, tolerance=1e-7, num_words=None):
+#     """Multi-word hyperplane-incidence bitmasks (pure NumPy).
+
+#     Parameters
+#     ----------
+#     vertices    : (V, n) float64 array
+#     hyperplanes : (H, n) float64 array  -- current boundary hyperplanes only
+#     b           : (H,)   float64 array
+#     tolerance   : float
+#     num_words   : int or None
+#         Total number of uint64 words needed to hold ALL hyperplane bits,
+#         including future neurons not yet in `hyperplanes`. Must satisfy
+#         num_words >= (global_bit_index_max + 1 + 63) // 64.
+#         If None, inferred from hyperplanes.shape[0] (may be too small for
+#         wide-mask mode — always pass explicitly from Enumerator_rapid).
+#     """
+#     n_verts  = vertices.shape[0]
+#     n_planes = hyperplanes.shape[0]
+#     if num_words is None:
+#         num_words = (n_planes + 63) // 64
+#     masks = np.zeros((n_verts, num_words), dtype=np.uint64)
+
+#     vals     = vertices @ hyperplanes.T + b   # (V, H)
+#     on_plane = np.abs(vals) <= tolerance       # (V, H) bool
+
+#     for h in range(n_planes):
+#         word = h // 64
+#         bit  = h % 64
+#         masks[on_plane[:, h], word] |= np.uint64(1 << bit)
+
+#     return masks
+
+
+# def _wide_popcount_ge(mask_u, mask_v, req_shared, num_words):
+#     """Return True if bitwise AND of two wide masks has >= req_shared bits set."""
+#     count = 0
+#     for w in range(num_words):
+#         temp = int(mask_u[w]) & int(mask_v[w])
+#         while temp > 0:
+#             temp &= temp - 1
+#             count += 1
+#             if count >= req_shared:
+#                 return True
+#     return False
+
+
+# def _wide_mask_or_and(shared_u, mask_u, bit_index, num_words):
+#     """Compute shared_u | (mask_u & (1 << bit_index)) for wide masks."""
+#     result = shared_u.copy()
+#     word = bit_index // 64
+#     bit  = bit_index % 64
+#     result[word] |= mask_u[word] & np.uint64(1 << bit)
+#     return result
+
+
+# def slice_polytope_wide(enumerate_poly, hyperplane_val, masks_w, i, n):
+#     """Slice a polytope using wide (multi-word) bitmask adjacency (pure NumPy)."""
+#     num_words  = masks_w.shape[1]
+#     req_shared = n - 1
+
+#     strict_index_in  = np.where(hyperplane_val < -1e-9)[0]
+#     strict_index_out = np.where(hyperplane_val >  1e-9)[0]
+#     index_in  = np.where(hyperplane_val <= 1e-5)[0]
+#     index_out = np.where(hyperplane_val >= -1e-5)[0]
+
+#     max_new = len(index_in) * len(index_out)
+#     new_verts_buffer = np.zeros((max_new, n),          dtype=np.float64)
+#     new_masks_buffer = np.zeros((max_new, num_words),   dtype=np.uint64)
+#     count = 0
+
+#     for k in range(len(strict_index_in)):
+#         u_idx  = strict_index_in[k]
+#         mask_u = masks_w[u_idx]
+
+#         for l in range(len(strict_index_out)):
+#             v_idx = strict_index_out[l]
+
+#             if hyperplane_val[u_idx] < -1e-9 and hyperplane_val[v_idx] > 1e-9:
+#                 mask_v      = masks_w[v_idx]
+#                 shared_mask = mask_u & mask_v
+
+#                 if _wide_popcount_ge(mask_u, mask_v, req_shared, num_words):
+#                     d1 = hyperplane_val[u_idx]
+#                     d2 = hyperplane_val[v_idx]
+#                     t  = -d1 / (d2 - d1)
+#                     new_verts_buffer[count] = (
+#                         enumerate_poly[u_idx]
+#                         + t * (enumerate_poly[v_idx] - enumerate_poly[u_idx])
+#                     )
+#                     new_masks_buffer[count] = _wide_mask_or_and(
+#                         shared_mask, mask_u, i, num_words
+#                     )
+#                     count += 1
+
+#     created_verts = new_verts_buffer[:count]
+#     created_masks = new_masks_buffer[:count]
+
+#     n_in  = len(index_in)
+#     n_out = len(index_out)
+
+#     verts_in  = np.empty((n_in  + count, n), dtype=np.float64)
+#     masks_in  = np.empty((n_in  + count, num_words), dtype=np.uint64)
+#     verts_out = np.empty((n_out + count, n), dtype=np.float64)
+#     masks_out = np.empty((n_out + count, num_words), dtype=np.uint64)
+
+#     verts_in[:n_in]   = enumerate_poly[index_in]
+#     masks_in[:n_in]   = masks_w[index_in]
+#     verts_in[n_in:]   = created_verts
+#     masks_in[n_in:]   = created_masks
+
+#     verts_out[:n_out] = enumerate_poly[index_out]
+#     masks_out[:n_out] = masks_w[index_out]
+#     verts_out[n_out:] = created_verts
+#     masks_out[n_out:] = created_masks
+
+#     return [verts_in, verts_out], [masks_in, masks_out], created_verts
+
+
+# # ---------------------------------------------------------------------------
+# # Storage helpers  (unchanged — no Numba involvement)
+# # ---------------------------------------------------------------------------
+
+# class RaggedPolytopeStorage:
+#     """Contiguous in-memory storage for variable-vertex polytopes."""
+
+#     def __init__(self):
+#         self.vertices       = None
+#         self.offsets        = [0]
+#         self.n_dim          = None
+#         self.total_vertices = 0
+
+#     def add_polytope(self, vertices):
+#         vertices = np.asarray(vertices, dtype=np.float64)
+#         if self.n_dim is None:
+#             self.n_dim    = vertices.shape[1]
+#             self.vertices = vertices.copy()
+#         else:
+#             self.vertices = np.vstack([self.vertices, vertices])
+#         self.total_vertices += len(vertices)
+#         self.offsets.append(self.total_vertices)
+
+#     def get_polytope(self, idx):
+#         return self.vertices[self.offsets[idx]:self.offsets[idx + 1]]
+
+#     def memory_usage_mb(self):
+#         if self.vertices is None:
+#             return 0.0
+#         return (self.vertices.nbytes + len(self.offsets) * 8) / (1024 * 1024)
+
+#     def __len__(self):
+#         return len(self.offsets) - 1
+
+#     def __getitem__(self, idx):
+#         return self.get_polytope(idx)
+
+
+# class HybridRaggedStorage:
+#     """Ragged storage with disk overflow (unchanged from Numba version)."""
+
+#     def __init__(self, memory_limit_mb=500, temp_dir=None):
+#         self.memory_limit_mb = memory_limit_mb
+#         self.temp_dir        = temp_dir or tempfile.mkdtemp()
+#         self.memory_storage  = RaggedPolytopeStorage()
+#         self.disk_chunks     = []
+#         self.mode            = "memory"
+#         self.total_polytopes = 0
+
+#     def add_polytope(self, vertices):
+#         vertices = np.asarray(vertices, dtype=np.float64)
+#         self.memory_storage.add_polytope(vertices)
+#         self.total_polytopes += 1
+
+#         if self.mode == "memory":
+#             if self.memory_storage.memory_usage_mb() > self.memory_limit_mb:
+#                 self._flush_to_disk()
+#                 self.mode = "disk"
+#         else:
+#             if len(self.memory_storage) >= 1000:
+#                 self._flush_to_disk()
+
+#     def _flush_to_disk(self):
+#         if len(self.memory_storage) == 0:
+#             return
+#         chunk_idx     = len(self.disk_chunks)
+#         vertices_file = os.path.join(self.temp_dir, f"vertices_{chunk_idx}.npy")
+#         offsets_file  = os.path.join(self.temp_dir, f"offsets_{chunk_idx}.npy")
+#         np.save(vertices_file, self.memory_storage.vertices)
+#         np.save(offsets_file,  np.array(self.memory_storage.offsets, dtype=np.int64))
+#         self.disk_chunks.append(
+#             {"vertices_file": vertices_file, "offsets_file": offsets_file,
+#              "count": len(self.memory_storage)}
+#         )
+#         import gc
+#         self.memory_storage = RaggedPolytopeStorage()
+#         gc.collect()
+
+#     def get_polytope(self, idx):
+#         cumulative = 0
+#         for chunk in self.disk_chunks:
+#             if idx < cumulative + chunk["count"]:
+#                 vertices  = np.load(chunk["vertices_file"])
+#                 offsets   = np.load(chunk["offsets_file"])
+#                 local_idx = idx - cumulative
+#                 return vertices[offsets[local_idx]:offsets[local_idx + 1]]
+#             cumulative += chunk["count"]
+#         return self.memory_storage[idx - cumulative]
+
+#     def cleanup(self):
+#         for chunk in self.disk_chunks:
+#             for key in ("vertices_file", "offsets_file"):
+#                 if os.path.exists(chunk[key]):
+#                     os.remove(chunk[key])
+#         if os.path.exists(self.temp_dir) and not os.listdir(self.temp_dir):
+#             os.rmdir(self.temp_dir)
+
+#     def __len__(self):
+#         return self.total_polytopes
+
+#     def __getitem__(self, idx):
+#         return self.get_polytope(idx)
+
+
+# # ---------------------------------------------------------------------------
+# # Deep hyperplane recovery  (unchanged)
+# # ---------------------------------------------------------------------------
+
+# def finding_deep_hype(hyperplanes, b, S_prime, border_hyperplane, border_bias, i, n):
+#     S_init = np.eye(np.shape(hyperplanes[0])[0])
+#     hype   = S_init @ hyperplanes[0]
+#     bias   = S_init @ b[0]
+
+#     m = 2 * n
+#     for j in range(0, i):
+#         border_hyperplane = np.vstack((border_hyperplane, hype))
+#         border_bias       = np.hstack((np.array(border_bias), bias))
+#         mid_point         = np.mean(S_prime, axis=0)
+#         S = np.sign(np.maximum(border_hyperplane @ mid_point + border_bias, 0))
+#         hype = hyperplanes[j + 1] @ np.diag(S[m:]) @ hype
+#         bias = hyperplanes[j + 1] @ np.diag(S[m:]) @ bias + b[j + 1]
+#         m   += np.shape(hyperplanes[j])[0]
+
+#     return hype, bias, border_hyperplane, border_bias.tolist()
