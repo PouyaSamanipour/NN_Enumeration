@@ -36,7 +36,15 @@ import numpy as np
 import torch
 import numba as nb
 
+# from .hessian_bound import HessianBounder, compute_local_gradient
+from .hessian_bound import HessianBounder, compute_local_gradient
+
 from .bitwise_utils import Enumerator_rapid,finding_deep_hype, generate_mask_wide,slice_polytope_wide
+from .Dynamics import load_dynamics, list_systems
+from .verify_certificates import verify_barrier
+from .verify_certificates import verify_lyapunov
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -673,7 +681,7 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
         if barrier_model is None:
             print("Warning: verification='barrier' requires barrier_model. Skipping.")
         else:
-            barrier_certificate_cells(
+            sv,BC,_=barrier_certificate_cells(
                 barrier_model, enumerate_poly, hyperplanes, b, name_file
             )
     else:
@@ -707,6 +715,29 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
     print(f"Polytope vertex data saved to: {out_h5}")
 
     
+    #### test Hessian of dynamics
+    
+    if verification == "barrier" and len(BC) > 0:
+        dynamics_name = name_file.split("/")[-1].split("_")[0].lower()
+        summary = verify_barrier(
+            BC, sv, hyperplanes, W, b,
+            barrier_model, dynamics_name=dynamics_name
+    )
+    if verification == "lyapunov":
+        # D_raw = Finding_cell_id(enumerate_poly, hyperplanes, b, num_hidden_layers)
+        sv_all = np.hstack([D_raw[l] for l in range(num_hidden_layers)]).T
+        summary = verify_lyapunov(
+            enumerate_poly, sv_all, hyperplanes, W, b,
+            barrier_model, dynamics_name=dynamics_name
+    )    
+
+
+
+
+    
+
+
+
 
 
     # ------------------------------------------------------------------
@@ -718,3 +749,5 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
             plot_polytope(enumerate_poly, "partition")
         except ImportError:
             print("visualization module not found; skipping 2-D visualisation.")
+
+

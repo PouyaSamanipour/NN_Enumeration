@@ -1586,3 +1586,5 @@ def finding_deep_hype(hyperplanes,b,S_prime,border_hyperplane,border_bias,i,n):
 #         m   += np.shape(hyperplanes[j])[0]
 
 #     return hype, bias, border_hyperplane, border_bias.tolist()
+
+

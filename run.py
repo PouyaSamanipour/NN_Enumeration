@@ -99,6 +99,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    print(args)
     parallel = not args.no_parallel
 
     # Validate barrier args early.
