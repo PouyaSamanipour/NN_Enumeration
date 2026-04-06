@@ -357,104 +357,62 @@ def _two_step_label(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Helpers for cell splitting
+# Refinement
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _build_child(
+def _child_vertices_and_boundary(
     vertices   : np.ndarray,   # (V, n) parent vertices
-    x_stars    : np.ndarray,   # (E, n) zero level set crossing points
+    x_stars    : np.ndarray,   # (E, n) ZLS crossing points (shared face)
     boundary_H : np.ndarray,
     boundary_b : np.ndarray,
-    p_i        : np.ndarray,   # (n,)
+    p_i        : np.ndarray,
     c_i        : float,
-    cut_H      : np.ndarray,   # (1, n) cutting hyperplane normal (already oriented)
-    cut_b      : np.ndarray,   # (1,)   cutting hyperplane offset
-    side_sign  : float,        # +1 if child is on cut_H @ x + cut_b >= 0 side
+    cut_d      : np.ndarray,   # (n,) cutting hyperplane normal
+    cut_offset : float,        # cutting hyperplane: cut_d @ x = cut_offset
+    side_sign  : float,        # +1: cut_d @ x >= cut_offset,  -1: cut_d @ x <= cut_offset
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Build child cell geometry for one side of a cut.
+    Build one child cell geometry for a cut.
 
-    Returns (child_vertices, boundary_H_child, boundary_b_child).
+    Child vertices:
+      - Parent vertices on the correct side of the cut
+      - ZLS crossing points (lie on the B=0 face, shared by both children)
 
-    Child vertices = parent vertices on correct side + crossing points.
-    Boundary includes: original boundary + cutting hyperplane + ZLS (B=0).
+    Augmented boundary:
+      - Original boundary
+      - Cutting hyperplane (oriented so child is on non-negative side)
+      - ZLS hyperplane p_i @ x + c_i = 0 as a boundary face
+
+    Returns (child_verts, bH_child, bb_child).
     """
-    n = vertices.shape[1]
-
-    # Parent vertices on this side
-    v_vals = vertices @ cut_H[0] + cut_b[0]   # (V,)
+    # Parent vertices on correct side
+    v_vals = vertices @ cut_d - cut_offset   # (V,)
     if side_sign > 0:
-        v_mask = v_vals >= -1e-9
+        mask = v_vals >= -1e-9
     else:
-        v_mask = v_vals <=  1e-9
+        mask = v_vals <=  1e-9
 
-    verts_side = vertices[v_mask]
+    verts_side  = vertices[mask]
+    child_verts = np.vstack([verts_side, x_stars]) if len(verts_side) > 0 else x_stars.copy()
 
-    # Child vertices: parent vertices on this side + zero level set crossings
-    if len(verts_side) == 0:
-        child_verts = x_stars
-    else:
-        child_verts = np.vstack([verts_side, x_stars])
-
-    # Augmented boundary: original + cutting hyperplane (oriented) + ZLS
-    # Cutting hyperplane oriented so child is on the non-negative side:
-    #   side_sign > 0:  cut_H @ x + cut_b >= 0  ->  add  cut_H,  cut_b
-    #   side_sign < 0:  cut_H @ x + cut_b <= 0  ->  add -cut_H, -cut_b
+    # Cutting hyperplane oriented so child is on non-negative side
     if side_sign > 0:
-        bH = np.vstack([boundary_H, cut_H])
-        bb = np.concatenate([boundary_b, cut_b])
+        ch = cut_d[None, :]
+        cb = np.array([-cut_offset])
     else:
-        bH = np.vstack([boundary_H, -cut_H])
-        bb = np.concatenate([boundary_b, -cut_b])
+        ch = -cut_d[None, :]
+        cb = np.array([cut_offset])
 
-    # Zero level set as boundary face (B=0 vertices exist in both children)
-    zls_H = p_i[None, :]
-    zls_b = np.array([c_i])
-    bH    = np.vstack([bH, zls_H])
-    bb    = np.concatenate([bb, zls_b])
+    # ZLS as boundary face
+    bH = np.vstack([boundary_H, ch, p_i[None, :]])
+    bb = np.concatenate([boundary_b, cb, np.array([c_i])])
 
     return child_verts, bH, bb
 
 
-def _get_child_crossings(
-    child_verts : np.ndarray,
-    x_stars     : np.ndarray,   # fallback if detection fails
-    sv_i        : np.ndarray,
-    barrier_model,
-    layer_W     : list,
-    layer_b     : list,
-    boundary_H  : np.ndarray,
-    boundary_b  : np.ndarray,
-    use_wide    : bool,
-) -> np.ndarray:
-    """Find zero level set crossings on a child cell."""
-    model_dtype = next(barrier_model.parameters()).dtype
-    with torch.no_grad():
-        B_child = barrier_model(
-            torch.tensor(child_verts.astype(np.float32), dtype=model_dtype)
-        ).numpy().ravel()
-
-    crossings = _get_zero_level_set_crossings(
-        child_verts, sv_i, B_child,
-        layer_W, layer_b, boundary_H, boundary_b, use_wide
-    )
-
-    # Fallback: if bitmask slicing finds nothing, use the known crossing points
-    # that belong to this child (those already on the B=0 face)
-    if len(crossings) == 0:
-        crossings = x_stars
-
-    return crossings
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Step 0: split X_i along zero level set, verify smaller child, discard other
-# ═══════════════════════════════════════════════════════════════════════════
-
 def _split_on_zls(
-    vertices        : np.ndarray,   # (V, n) original cell vertices
-    x_stars         : np.ndarray,   # (E, n) zero level set crossings
-    sv_i            : np.ndarray,
+    vertices        : np.ndarray,   # (V, n) original cell X_i
+    x_stars         : np.ndarray,   # (E, n) ZLS crossings — already found
     p_i             : np.ndarray,
     c_i             : float,
     barrier_model,
@@ -471,84 +429,47 @@ def _split_on_zls(
     max_depth       : int,
 ) -> Tuple[Label, float, float, float, Optional[Counterexample]]:
     """
-    Split X_i along zero level set B(x)=0 into X_i^+ and X_i^-.
+    Step 0: split X_i along its zero level set B(x) = 0.
 
-    Both children share the zero level set as a face — its vertices appear
-    in both. Therefore we only need to verify ONE child (the smaller one).
-    The certificate condition is the same on the shared face regardless of
-    which side you verify from, so verifying one covers the boundary.
+    Both children share the ZLS face (x_stars are vertices of both).
+    We only need to refine ONE child (the smaller one) — the ZLS face
+    is identical in both so verifying one covers the shared boundary.
 
-    After this initial split, we call _refine_barrier which verifies BOTH
-    children when splitting with fake neurons.
+    We do NOT re-run _two_step_label here — it was already INCONCLUSIVE.
+    We go directly to _refine_barrier on the chosen child.
     """
     n = vertices.shape[1]
 
-    # ZLS hyperplane as the cut: p_i @ x + c_i = 0
-    cut_H = p_i[None, :]
-    cut_b = np.array([c_i])
+    # Pick smaller child by number of non-ZLS parent vertices on each side
+    v_vals = vertices @ p_i + c_i   # (V,)
+    n_pos  = int((v_vals >= -1e-9).sum())
+    n_neg  = int((v_vals <=  1e-9).sum())
+    side   = +1 if n_pos <= n_neg else -1
 
-    # Build both children
-    verts_pos, bH_pos, bb_pos = _build_child(
+    child_verts, child_bH, child_bb = _child_vertices_and_boundary(
         vertices, x_stars, boundary_H, boundary_b,
-        p_i, c_i, cut_H, cut_b, side_sign=+1
+        p_i, c_i, p_i, -c_i, side_sign=side
     )
-    verts_neg, bH_neg, bb_neg = _build_child(
-        vertices, x_stars, boundary_H, boundary_b,
-        p_i, c_i, cut_H, cut_b, side_sign=-1
-    )
-
-    # Pick smaller child by number of non-ZLS vertices
-    v_vals  = vertices @ p_i + c_i   # (V,)
-    n_pos   = int((v_vals >= -1e-9).sum())
-    n_neg   = int((v_vals <=  1e-9).sum())
-
-    if n_pos <= n_neg:
-        child_verts, child_bH, child_bb = verts_pos, bH_pos, bb_pos
-    else:
-        child_verts, child_bH, child_bb = verts_neg, bH_neg, bb_neg
 
     if len(child_verts) < n + 1:
-        # Degenerate — fall back to original crossings
-        return _two_step_label(
-            x_stars, barrier_model, dyn, hb, p_i, cell_idx, continuous_time
-        )
+        return Label.INCONCLUSIVE, 0.0, 0.0, 0.0, None
 
-    # Get crossings on chosen child
-    child_crossings = _get_child_crossings(
-        child_verts, x_stars, sv_i, barrier_model,
-        layer_W, layer_b, child_bH, child_bb, use_wide
-    )
-
-    if len(child_crossings) == 0:
-        return Label.SAFE, 0.0, 0.0, 0.0, None
-
-    # Two-step label on chosen child
-    label, M_i, r_i, remainder, ce = _two_step_label(
-        child_crossings, barrier_model, dyn, hb, p_i, cell_idx, continuous_time
-    )
-
-    if label != Label.INCONCLUSIVE:
-        return label, M_i, r_i, remainder, ce
-
-    # INCONCLUSIVE — refine with fake neuron (must verify BOTH children)
+    # x_stars are the ZLS face vertices of the chosen child — use directly
+    # Do NOT re-run two-step label (it was already INCONCLUSIVE with these points)
+    # Go directly to fake neuron refinement
     return _refine_barrier(
-        child_crossings, child_verts, sv_i, p_i, c_i,
+        x_stars, child_verts, p_i, c_i,
         barrier_model, dyn, hb,
         layer_W, layer_b, W_out,
         child_bH, child_bb,
         cell_idx, continuous_time, use_wide,
-        max_depth - 1,
+        max_depth,
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Refinement by fake neuron — BOTH children must be verified
-# ═══════════════════════════════════════════════════════════════════════════
-
 def _refine_barrier(
-    x_stars         : np.ndarray,   # (E, n) current crossing points
+    x_stars         : np.ndarray,   # (E, n) ZLS crossing points of current cell
     vertices        : np.ndarray,   # (V, n) current cell vertices
-    sv_i            : np.ndarray,
     p_i             : np.ndarray,
     c_i             : float,
     barrier_model,
@@ -565,21 +486,21 @@ def _refine_barrier(
     max_depth       : int,
 ) -> Tuple[Label, float, float, float, Optional[Counterexample]]:
     """
-    Refine INCONCLUSIVE cell by splitting with a fake neuron hyperplane.
+    Refine by splitting with a fake neuron hyperplane.
 
-    Unlike the initial ZLS split, fake neuron splits create two children
-    that do NOT share the zero level set face — BOTH must be verified.
+    The fake neuron splits the ZLS face (x_stars) into two halves.
+    Each half belongs to a child cell — BOTH must be verified because
+    after this split the ZLS face is no longer shared: each child has
+    its own subset of crossing points.
 
-    Strategy:
-      1. Find principal direction d of x_stars via SVD
-      2. Fake hyperplane: d^T x = d^T c*
-      3. Split into two children, build each with correct boundary
-      4. Verify BOTH children with two-step label
-      5. If either is INCONCLUSIVE, recurse on it
-      6. SAFE only when ALL children are SAFE
-      7. UNSAFE as soon as any child is UNSAFE
+    Per child:
+      1. Child crossing points = x_stars on that side
+      2. Run _two_step_label on child's crossing points
+      3. If SAFE -> flush this child
+      4. If UNSAFE -> return immediately
+      5. If INCONCLUSIVE -> recurse (add another fake neuron)
 
-    Termination: only B(f(x*)) = 0 (tangent) stays INCONCLUSIVE at max_depth.
+    SAFE only when ALL children are SAFE.
     """
     if max_depth == 0 or len(x_stars) < 2:
         return Label.INCONCLUSIVE, 0.0, 0.0, 0.0, None
@@ -587,60 +508,50 @@ def _refine_barrier(
     n      = x_stars.shape[1]
     c_star = x_stars.mean(axis=0)
 
-    # ── Principal direction via SVD ───────────────────────────────────────────
+    # Principal direction of crossing points — direction of max spread
     X = x_stars - c_star
     if np.linalg.norm(X) < 1e-12:
         return Label.INCONCLUSIVE, 0.0, 0.0, 0.0, None
 
-    _, _, Vt  = np.linalg.svd(X, full_matrices=False)
-    d         = Vt[0]
-    offset    = float(d @ c_star)
-    cut_H     = d[None, :]
-    cut_b     = np.array([-offset])   # d @ x - offset = 0
+    _, _, Vt   = np.linalg.svd(X, full_matrices=False)
+    d          = Vt[0]
+    offset     = float(d @ c_star)
 
-    # ── Build both children ───────────────────────────────────────────────────
-    verts_pos, bH_pos, bb_pos = _build_child(
-        vertices, x_stars, boundary_H, boundary_b,
-        p_i, c_i, cut_H, cut_b, side_sign=+1
-    )
-    verts_neg, bH_neg, bb_neg = _build_child(
-        vertices, x_stars, boundary_H, boundary_b,
-        p_i, c_i, cut_H, cut_b, side_sign=-1
-    )
+    # Split crossing points
+    signed = x_stars @ d - offset   # (E,)
+    xs_pos = x_stars[signed >= -1e-9]
+    xs_neg = x_stars[signed <=  1e-9]
 
-    # ── Split crossing points between children ────────────────────────────────
-    signed    = x_stars @ d - offset
-    xs_pos    = x_stars[signed >= -1e-9]
-    xs_neg    = x_stars[signed <=  1e-9]
+    if len(xs_pos) == 0 or len(xs_neg) == 0:
+        return Label.INCONCLUSIVE, 0.0, 0.0, 0.0, None
+
+    # Build both child cells
+    verts_pos, bH_pos, bb_pos = _child_vertices_and_boundary(
+        vertices, x_stars, boundary_H, boundary_b,
+        p_i, c_i, d, offset, side_sign=+1
+    )
+    verts_neg, bH_neg, bb_neg = _child_vertices_and_boundary(
+        vertices, x_stars, boundary_H, boundary_b,
+        p_i, c_i, d, offset, side_sign=-1
+    )
 
     children = [
-        (verts_pos, bH_pos, bb_pos, xs_pos),
-        (verts_neg, bH_neg, bb_neg, xs_neg),
+        (xs_pos, verts_pos, bH_pos, bb_pos),
+        (xs_neg, verts_neg, bH_neg, bb_neg),
     ]
 
-    # ── Verify BOTH children ──────────────────────────────────────────────────
-    worst_M   = 0.0
-    worst_r   = 0.0
-    worst_rem = 0.0
+    worst_M = worst_r = worst_rem = 0.0
 
-    for child_verts, child_bH, child_bb, xs_child in children:
-        if len(child_verts) < n + 1 or len(xs_child) == 0:
-            continue   # degenerate child — treat as safe
+    for xs_child, child_verts, child_bH, child_bb in children:
+        if len(xs_child) == 0:
+            continue   # no crossings on this side — safe
 
-        child_crossings = _get_child_crossings(
-            child_verts, xs_child, sv_i, barrier_model,
-            layer_W, layer_b, child_bH, child_bb, use_wide
-        )
-
-        if len(child_crossings) == 0:
-            continue   # no crossings on this child — safe
-
+        # Verify this child
         label, M_i, r_i, remainder, ce = _two_step_label(
-            child_crossings, barrier_model, dyn, hb,
+            xs_child, barrier_model, dyn, hb,
             p_i, cell_idx, continuous_time
         )
 
-        # Track worst-case values for reporting
         worst_M   = max(worst_M,   M_i)
         worst_r   = max(worst_r,   r_i)
         worst_rem = max(worst_rem, remainder)
@@ -649,24 +560,27 @@ def _refine_barrier(
             return Label.UNSAFE, M_i, r_i, remainder, ce
 
         if label == Label.INCONCLUSIVE:
-            # Recurse on this child
             label, M_i, r_i, remainder, ce = _refine_barrier(
-                child_crossings, child_verts, sv_i, p_i, c_i,
+                xs_child, child_verts, p_i, c_i,
                 barrier_model, dyn, hb,
                 layer_W, layer_b, W_out,
                 child_bH, child_bb,
                 cell_idx, continuous_time, use_wide,
                 max_depth - 1,
             )
+            worst_M   = max(worst_M,   M_i)
+            worst_r   = max(worst_r,   r_i)
+            worst_rem = max(worst_rem, remainder)
 
             if label == Label.UNSAFE:
                 return Label.UNSAFE, M_i, r_i, remainder, ce
-
             if label == Label.INCONCLUSIVE:
                 return Label.INCONCLUSIVE, worst_M, worst_r, worst_rem, None
 
-    # All children verified SAFE
     return Label.SAFE, worst_M, worst_r, worst_rem, None
+
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -778,7 +692,7 @@ def verify_barrier(
             barrier_model(
                 torch.tensor(centroid.astype(np.float32)[None, :],
                              dtype=model_dtype)
-            ) 
+            ).numpy().ravel()[0]
         ) - float(p_i @ centroid)
 
         # Find zero level set crossings
@@ -805,7 +719,7 @@ def verify_barrier(
         # Step 1+ — fake neuron splits, verify BOTH children
         if label == Label.INCONCLUSIVE:
             label, M_i, r_i, remainder, ce = _split_on_zls(
-                vertices, x_stars, sv_i, p_i, c_i,
+                vertices, x_stars, p_i, c_i,
                 barrier_model, dyn, hb,
                 layer_W, layer_b, W_out,
                 boundary_H, boundary_b,
