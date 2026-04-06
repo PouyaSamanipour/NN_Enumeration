@@ -31,6 +31,7 @@ import os
 import tempfile
 import time
 
+from click import Tuple
 import numpy as np
 from numba import njit, prange
 from numba import types  # noqa: F401  (kept for potential extension)
@@ -1588,3 +1589,59 @@ def finding_deep_hype(hyperplanes,b,S_prime,border_hyperplane,border_bias,i,n):
 #     return hype, bias, border_hyperplane, border_bias.tolist()
 
 
+def get_cell_hyperplanes_input_space(
+    sv_i           : np.ndarray,   # (total_neurons,) activation pattern
+    layer_W        : list,         # layer_W[l] shape (H_l, n_in_l)
+    layer_b        : list,         # layer_b[l] shape (H_l,)
+    boundary_H     : np.ndarray,   # (B, n) domain boundary hyperplane normals
+    boundary_b     : np.ndarray,   # (B,)   domain boundary offsets
+):
+    """
+    Compute all hyperplanes forming cell i in input space.
+
+    Combines:
+      1. Network hyperplanes — each neuron's activation boundary mapped
+         back to input space via the fixed activation pattern sv_i.
+      2. Domain boundary hyperplanes — safe set or domain constraints.
+
+    The output feeds directly into generate_mask() and
+    slice_polytope_with_hyperplane() for correct polytope splitting.
+
+    Returns
+    -------
+    H_all : (total_neurons + B, n)  hyperplane normals in input space
+    b_all : (total_neurons + B,)    hyperplane offsets
+    """
+    n = layer_W[0].shape[1]
+
+    # Split activation pattern into per-layer masks
+    layer_sizes = [W.shape[0] for W in layer_W]
+    masks = []
+    offset = 0
+    for size in layer_sizes:
+        masks.append(sv_i[offset: offset + size])
+        offset += size
+
+    H_planes = []
+    b_planes = []
+
+    A_prev = np.eye(n)
+    b_prev = np.zeros(n)
+
+    for W, b, mask in zip(layer_W, layer_b, masks):
+        # Pre-activation of this layer in input space
+        H_l = W @ A_prev        # (H_l, n)
+        o_l = W @ b_prev + b    # (H_l,)
+
+        H_planes.append(H_l)
+        b_planes.append(o_l)
+
+        # Update linear map for next layer: apply D_l
+        A_prev = mask[:, None] * H_l   # (H_l, n)
+        b_prev = mask * o_l            # (H_l,)
+
+    # Stack network hyperplanes with domain boundaries
+    H_all = np.vstack([*H_planes, boundary_H])
+    b_all = np.concatenate([*b_planes, boundary_b])
+
+    return H_all, b_all

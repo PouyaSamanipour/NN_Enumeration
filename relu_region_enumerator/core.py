@@ -551,6 +551,9 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
     # boundary_hyperplane @ x + border_bias <= 0 defines the domain interior.
     border_hyperplane = np.vstack((np.eye(n), -np.eye(n)))
     border_bias       = list(TH) + list(TH)   # [TH[0],...,TH[n-1], TH[0],...,TH[n-1]]
+    bdh=np.copy(border_hyperplane)
+    bdb=np.copy(border_bias)
+
 
     # ------------------------------------------------------------------
     # 3. Layer-by-layer enumeration
@@ -587,7 +590,7 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
 
             if i == 0:
                 # First layer: all polytopes share the same input domain.
-                enumerate_poly_n = Enumerator_rapid(
+                enumerate_poly_n= Enumerator_rapid(
                     hyperplanes[i], b[i],
                     original_polytope_test, TH,
                     [border_hyperplane], [border_bias],
@@ -603,7 +606,7 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
                     border_hyperplane, border_bias,
                     i, n,
                 )
-                enumerate_poly_n = Enumerator_rapid(
+                enumerate_poly_n= Enumerator_rapid(
                     hype1, bias1,
                     np.array([enumerate_poly[j]]), TH,
                     [border_hyperplane1], [border_bias1],
@@ -720,7 +723,7 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
     if verification == "barrier" and len(BC) > 0:
         dynamics_name = name_file.split("/")[-1].split("_")[0].lower()
         summary = verify_barrier(
-            BC, sv, hyperplanes, W, b,
+            BC, sv, hyperplanes, b, W,bdh,bdb,
             barrier_model, dynamics_name=dynamics_name
     )
     if verification == "lyapunov":

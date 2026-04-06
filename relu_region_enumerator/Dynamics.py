@@ -153,6 +153,39 @@ def get_dynamics_quadrotor():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Decay  (6D polynomial)
+# ═══════════════════════════════════════════════════════════════════════════
+def get_dynamics_decay():
+    """
+    6D nonlinear polynomial system — each component decays toward origin.
+    Domain: [-3, 3]^6
+    Reference: Ren et al. 2026 (Decay benchmark), Zhang et al. NeurIPS 2023
+
+    Dynamics:
+        x_dot_i = -x_i * (1 + x1^2 + x2^2 + x3^2 + x4^2 + x5^2 + x6^2)
+    for i = 1, ..., 6.
+
+    The common factor r^2 = sum_i x_i^2 makes this a radially symmetric
+    contracting system. The origin is globally asymptotically stable.
+    """
+    syms = sp.symbols('x1:7')   # x1, x2, x3, x4, x5, x6
+    x1, x2, x3, x4, x5, x6 = syms
+
+    r_sq = x1**2 + x2**2 + x3**2 + x4**2 + x5**2 + x6**2
+    factor = 1 + r_sq
+
+    f = [
+        -x1 * factor,
+        -x2 * factor,
+        -x3 * factor,
+        -x4 * factor,
+        -x5 * factor,
+        -x6 * factor,
+    ]
+    return syms, f
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Registry
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -160,6 +193,7 @@ _REGISTRY = {
     "arch3"     : get_dynamics_arch3,
     "complex"   : get_dynamics_complex,
     "quadrotor" : get_dynamics_quadrotor,
+    "decay"     : get_dynamics_decay,
 }
 
 

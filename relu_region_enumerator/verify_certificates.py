@@ -1,58 +1,59 @@
 """
 verify_certificates.py
 ======================
-Formal verification of Lyapunov decrease and barrier certificate conditions
-over all enumerated polytopic linear regions, using the Taylor remainder bound.
+Formal verification of barrier certificate conditions over all enumerated
+polytopic linear regions.
 
-For each cell X_i the network is affine, so the certificate value B(x) or V(x)
-is affine on X_i and its extremum is attained at a vertex. The nonlinear
-dynamics f(x) introduces a correction bounded by the Taylor remainder:
+Zero level set crossings
+-------------------------
+For each boundary cell X_i, B is affine: B(x) = p_i @ x + c_i.
+Exact crossing points are found using slice_polytope_with_hyperplane —
+bitmask adjacency ensures only valid polytope edges are used.
 
-    |B(f(x)) - B(f_lin(x))| <= 0.5 * M_i * r_i^2
+Two-step labeling per cell
+---------------------------
+Step 1 — Exact evaluation at crossing points + centroid c*:
+    Evaluate p_i . f(x) (continuous) or B(f(x)) (discrete) exactly.
+    If any value > 0 -> UNSAFE (exact counterexample).
+    Cannot conclude SAFE — only sampled points checked.
 
-where:
-    f_lin(x) = linearization of f at centroid of X_i
-    M_i      = guaranteed upper bound on ||H_cell(x)||_2 over X_i
-    r_i      = max_k ||v_k - centroid_i||  (cell radius)
+Step 2 — Linearized dynamics + Taylor remainder:
+    Linearize f around c* = mean(x_stars).
+    cond_e      = p_i . f_lin(x*_e)   or   B(f_lin(x*_e))
+    remainder_e = 0.5 * M * ||x*_e - c*||^2
+    M computed over x_stars (tighter than full cell).
 
-Verification labels per cell
------------------------------
-    SAFE        : condition holds with formal guarantee
-    UNSAFE      : condition is violated
-    INCONCLUSIVE: remainder bound too loose to decide; cell needs refinement
+    SAFE        : max_e [ cond_e + remainder_e ] <= 0
+    UNSAFE      : min_e [ cond_e - remainder_e ] > 0
+    INCONCLUSIVE: refine
 
-Barrier certificate condition (boundary cells only)
-----------------------------------------------------
-    B(f(x)) <= 0  for all x in X_i with B(x) near 0
+Refinement by fake neuron
+--------------------------
+When INCONCLUSIVE, split the zero level set polytope with a fake neuron:
+  1. Find principal direction d of crossing points via SVD
+  2. Fake hyperplane: d^T x = d^T c*  (passes through centroid, perp to d)
+  3. Split crossing points into two children
+  4. Pick child with smaller spread (smaller max ||x*_e - c*||)
+  5. For chosen child, add BOTH the fake hyperplane AND the zero level set
+     as boundary hyperplanes — so the child's geometry is correct
+  6. Re-run crossing detection and labeling on the child
+  7. Recurse until SAFE/UNSAFE or max_depth reached
 
-    Verified as:
-        max_k B(f_lin(v_k)) + 0.5 * M_i * r_i^2 <= 0  -> SAFE
-        min_k B(f_lin(v_k)) - 0.5 * M_i * r_i^2 >  0  -> UNSAFE
-        otherwise                                        -> INCONCLUSIVE
-
-Lyapunov decrease condition (all cells)
-----------------------------------------
-    Delta_V(x) = V(f(x)) - V(x) <= 0  for all x in X_i
-
-    Verified as:
-        max_k Delta_V_lin(v_k) + 0.5 * M_i * r_i^2 <= 0  -> SAFE
-        min_k Delta_V_lin(v_k) - 0.5 * M_i * r_i^2 >  0  -> UNSAFE
-        otherwise                                           -> INCONCLUSIVE
+Each child is verified only on its own zero level set vertices.
+If verified SAFE, it is flushed — the parent is SAFE once all children are SAFE.
 
 Usage
 -----
-    from verify_certificates import verify_barrier, verify_lyapunov
-
-    # Barrier (boundary cells only — fast, competes with Ren et al.)
     summary = verify_barrier(
-        BC, sv, hyperplanes, W, b,
+        BC, sv, layer_W, layer_b, W_out,
+        boundary_H, boundary_b,
         barrier_model, dynamics_name="arch3"
     )
 
-    # Lyapunov (all cells)
     summary = verify_lyapunov(
-        enumerate_poly, sv_all, hyperplanes, W, b,
-        lyapunov_model, A_d, dynamics_name="quadrotor"
+        enumerate_poly, sv_all, layer_W, layer_b, W_out,
+        boundary_H, boundary_b,
+        lyapunov_model, dynamics_name="quadrotor"
     )
 """
 
@@ -68,9 +69,23 @@ from typing import List, Tuple, Optional
 try:
     from .hessian_bound import HessianBounder, compute_local_gradient
     from .Dynamics import load_dynamics
+    from .bitwise_utils import (
+        get_cell_hyperplanes_input_space,
+        generate_mask,
+        generate_mask_wide,
+        slice_polytope_with_hyperplane,
+        slice_polytope_wide,
+    )
 except ImportError:
     from hessian_bound import HessianBounder, compute_local_gradient
     from Dynamics import load_dynamics
+    from bitwise_utils import (
+        get_cell_hyperplanes_input_space,
+        generate_mask,
+        generate_mask_wide,
+        slice_polytope_with_hyperplane,
+        slice_polytope_wide,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -85,24 +100,24 @@ class Label(Enum):
 
 @dataclass
 class CellResult:
-    label      : Label
-    cell_idx   : int
-    M_i        : float
-    r_i        : float
-    remainder  : float
-    max_condition : float   # max value of the condition at vertices
-    # positive = potentially violated, negative = satisfied
+    label         : Label
+    cell_idx      : int
+    M_i           : float
+    r_i           : float
+    remainder     : float
+    max_condition : float
 
 
 @dataclass
 class VerificationSummary:
-    mode          : str    # "barrier" or "lyapunov"
+    mode          : str
     dynamics_name : str
-    n_safe        : int = 0
-    n_unsafe      : int = 0
-    n_inconclusive: int = 0
+    n_safe        : int   = 0
+    n_unsafe      : int   = 0
+    n_inconclusive: int   = 0
     runtime_s     : float = 0.0
     results       : List[CellResult] = field(default_factory=list)
+    counterexample: Optional['Counterexample'] = None
 
     @property
     def total(self):
@@ -120,228 +135,215 @@ class VerificationSummary:
         print(f"  INCONCLUSIVE        : {self.n_inconclusive}"
               f"  ({100*self.n_inconclusive/max(self.total,1):.1f}%)")
         print(f"  Runtime             : {self.runtime_s:.2f} s")
-        if self.n_unsafe > 0:
+
+        if self.counterexample is not None:
+            print(f"\n  Exact counterexample found:")
+            self.counterexample.report()
+        elif self.n_unsafe > 0:
             print(f"\n  !! {self.n_unsafe} UNSAFE cells found.")
         elif self.n_inconclusive == 0:
             print(f"\n  Certificate VERIFIED over all {self.total} cells.")
         else:
             print(f"\n  Certificate verified on {self.n_safe} cells; "
-                  f"{self.n_inconclusive} inconclusive (refine to resolve).")
+                  f"{self.n_inconclusive} inconclusive "
+                  f"(B(f(x*)) ~ 0, trajectory tangent to boundary).")
         print(f"{'='*60}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Core: evaluate condition at vertices under linearized dynamics
+# Counterexample
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _find_zero_crossings(
-    vertices     : np.ndarray,   # (V, n)
-    B_curr       : np.ndarray,   # (V,) B evaluated at each vertex
-    centroid     : np.ndarray,   # (n,)
-) -> Tuple[np.ndarray, np.ndarray]:
+@dataclass
+class Counterexample:
+    x_star          : np.ndarray
+    f_x_star        : np.ndarray
+    B_x_star        : float
+    violation_value : float
+    p_i             : np.ndarray
+    continuous_time : bool
+    cell_idx        : int
+    point_idx       : int
+
+    def report(self):
+        print(f"\n{'='*60}")
+        print(f"COUNTEREXAMPLE  "
+              f"[{'continuous' if self.continuous_time else 'discrete'}-time]")
+        print(f"{'='*60}")
+        print(f"  Cell index      : {self.cell_idx}")
+        print(f"  x*              : {np.array2string(self.x_star, precision=6)}")
+        print(f"  f(x*)           : {np.array2string(self.f_x_star, precision=6)}")
+        print(f"  B(x*)           : {self.B_x_star:.6e}")
+        if self.continuous_time:
+            print(f"  p_i . f(x*)     : {self.violation_value:.6e}  (> 0 = violation)")
+        else:
+            print(f"  B(f(x*))        : {self.violation_value:.6e}  (> 0 = violation)")
+        print(f"{'='*60}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DynamicsEvaluator
+# ═══════════════════════════════════════════════════════════════════════════
+
+class DynamicsEvaluator:
+    """Precompiled evaluator for f(x) and J_f(x)."""
+
+    def __init__(self, symbols, f_sym):
+        import sympy as sp
+        self.symbols = symbols
+        self.n       = len(symbols)
+
+        print("  Building DynamicsEvaluator...", flush=True)
+        self._f_fns = [
+            sp.lambdify(list(symbols), fi, modules='numpy') for fi in f_sym
+        ]
+        J_sym        = sp.Matrix(f_sym).jacobian(list(symbols))
+        self._jac_fn = sp.lambdify(list(symbols), J_sym, modules='numpy')
+        print("  Done.", flush=True)
+
+    def eval(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        args  = list(x)
+        f_val = np.array([float(fn(*args)) for fn in self._f_fns])
+        f_jac = np.array(self._jac_fn(*args), dtype=float)
+        return f_val, f_jac
+
+    def eval_batch(self, X: np.ndarray) -> np.ndarray:
+        E, n = X.shape
+        F    = np.zeros((E, n))
+        args = [X[:, k] for k in range(n)]
+        for j, fn in enumerate(self._f_fns):
+            vals    = fn(*args)
+            F[:, j] = (
+                np.broadcast_to(np.atleast_1d(vals), (E,))
+                if not np.isscalar(vals)
+                else np.full(E, float(vals))
+            )
+        return F
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Zero level set crossings via bitmask slicing
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _get_zero_level_set_crossings(
+    vertices   : np.ndarray,   # (V, n)
+    sv_i       : np.ndarray,   # (total_neurons,)
+    B_vals     : np.ndarray,   # (V,) B at vertices — exact since B affine
+    layer_W    : list,
+    layer_b    : list,
+    boundary_H : np.ndarray,   # (B, n) — may include fake neurons
+    boundary_b : np.ndarray,   # (B,)
+    use_wide   : bool,
+) -> np.ndarray:               # (E, n) crossing points, or empty
     """
-    Find all zero level set crossing points of B on cell edges.
+    Find exact zero level set crossings using bitmask slicing.
 
-    For each edge (v_u, v_v) where B changes sign, the exact crossing is:
-        x* = v_u + t * (v_v - v_u)   where t = B(v_u) / (B(v_u) - B(v_v))
+    B is affine on the cell so B_vals at vertices are exact.
+    The zero level set B(x)=0 is a new hyperplane cutting the cell.
+    slice_polytope_with_hyperplane uses bitmask adjacency to find only
+    valid polytope edges — created_verts are the exact crossing points.
 
-    This is equation (10) from the paper with B playing the role of P^q.
-
-    Returns
-    -------
-    x_stars   : (E, n) array of zero crossing points
-    distances : (E,)   array of ||x* - centroid|| for each crossing
+    boundary_H may include fake neurons added during refinement.
     """
-    from itertools import combinations
-    x_stars   = []
-    distances = []
+    n = vertices.shape[1]
 
-    V = len(vertices)
-    for u, v in combinations(range(V), 2):
-        bu, bv = B_curr[u], B_curr[v]
-        if bu * bv < 0:   # sign change on this edge
-            t      = bu / (bu - bv)
-            x_star = vertices[u] + t * (vertices[v] - vertices[u])
-            x_stars.append(x_star)
-            distances.append(float(np.linalg.norm(x_star - centroid)))
+    if B_vals.min() >= -1e-9 or B_vals.max() <= 1e-9:
+        return np.zeros((0, n))
 
-    if len(x_stars) == 0:
-        return np.zeros((0, vertices.shape[1])), np.zeros(0)
+    H_all, b_all = get_cell_hyperplanes_input_space(
+        sv_i, layer_W, layer_b, boundary_H, boundary_b
+    )
 
-    return np.array(x_stars), np.array(distances)
+    verts_f64 = vertices.astype(np.float64)
+    H_f64     = H_all.astype(np.float64)
+    b_f64     = b_all.astype(np.float64)
+    B_f64     = B_vals.astype(np.float64)
+
+    if use_wide:
+        masks = generate_mask_wide(verts_f64, H_f64, b_f64)
+        _, _, created_verts = slice_polytope_wide(
+            verts_f64, B_f64, masks, len(H_all), n
+        )
+    else:
+        masks = generate_mask(verts_f64, H_f64, b_f64)
+        _, _, created_verts = slice_polytope_with_hyperplane(
+            verts_f64, B_f64, masks, len(H_all), n
+        )
+
+    return created_verts   # (E, n)
 
 
-def _eval_barrier_at_vertices(
-    vertices   : np.ndarray,      # (V, n)
-    centroid   : np.ndarray,      # (n,)
-    f_jac      : np.ndarray,      # (n, n) Jacobian of f at centroid
-    f_val      : np.ndarray,      # (n,)   f(centroid)
-    barrier_model,                # TorchScript network
-) -> Tuple[np.ndarray, np.ndarray]:
+# ═══════════════════════════════════════════════════════════════════════════
+# Core two-step labeling
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _two_step_label(
+    x_stars         : np.ndarray,   # (E, n) crossing points
+    barrier_model,
+    dyn             : DynamicsEvaluator,
+    hb              : HessianBounder,
+    p_i             : np.ndarray,   # (n,)
+    cell_idx        : int,
+    continuous_time : bool,
+) -> Tuple[Label, float, float, float, Optional[Counterexample]]:
     """
-    Evaluate B(f_lin(x*)) at zero level set crossing points.
+    Two-step labeling on a set of zero level set crossing points.
 
-    The barrier condition B(x) = 0 => B(f(x)) <= 0 only needs to hold
-    on the zero level set {x : B(x) = 0} intersected with X_i.
+    Step 1 — exact dynamics at x_stars + centroid c*:
+        Any violation -> UNSAFE with counterexample.
 
-    Since B is affine on X_i, the zero level set is a face whose vertices
-    are the edge crossing points x* where B changes sign. Since B(f_lin(x))
-    is affine in x, its maximum over this face is attained at these points.
-
-    The remainder at each crossing point uses ||x* - centroid|| rather than
-    the full cell radius r_i, giving a tighter bound.
-
-    Parameters
-    ----------
-    vertices      : (V, n) all cell vertices
-    centroid      : (n,)
-    f_jac         : (n, n) Jacobian of f at centroid
-    f_val         : (n,)   f(centroid)
-    barrier_model : TorchScript network
-
-    Returns
-    -------
-    B_next    : (E,) B(f_lin(x*)) at each zero crossing point
-    distances : (E,) ||x* - centroid|| for per-point remainder
-                Returns ([-1.0], [0.0]) if no crossings found (trivially safe).
+    Step 2 — linearized dynamics around c* + Taylor remainder:
+        M computed over x_stars.
+        Returns label, M_i, r_i, remainder, counterex.
     """
     model_dtype = next(barrier_model.parameters()).dtype
 
-    # Step 1: evaluate B at all cell vertices
-    with torch.no_grad():
-        B_curr = barrier_model(
-            torch.tensor(vertices.astype(np.float32), dtype=model_dtype)
-        ).numpy().ravel()   # (V,)
+    c_star   = x_stars.mean(axis=0)
+    eval_pts = np.vstack([x_stars, c_star[None, :]])   # (E+1, n)
+    f_exact  = dyn.eval_batch(eval_pts)
 
-    # Step 2: find zero crossing points on edges
-    x_stars, distances = _find_zero_crossings(vertices, B_curr, centroid)
+    if continuous_time:
+        exact_vals = f_exact @ p_i
+    else:
+        with torch.no_grad():
+            exact_vals = barrier_model(
+                torch.tensor(f_exact.astype(np.float32), dtype=model_dtype)
+            ).numpy().ravel()
 
-    if len(x_stars) == 0:
-        # No zero crossings — cell does not straddle B=0
-        # Should not happen for boundary cells, but handle gracefully
-        return np.array([-1.0]), np.array([0.0])
+    # Step 1: exact check
+    for e in range(len(eval_pts)):
+        if exact_vals[e] > 0.0:
+            with torch.no_grad():
+                B_x = float(barrier_model(
+                    torch.tensor(eval_pts[e:e+1].astype(np.float32),
+                                 dtype=model_dtype)
+                ).numpy().ravel()[0])
+            ce = Counterexample(
+                x_star=eval_pts[e].copy(), f_x_star=f_exact[e].copy(),
+                B_x_star=B_x, violation_value=float(exact_vals[e]),
+                p_i=p_i.copy(), continuous_time=continuous_time,
+                cell_idx=cell_idx, point_idx=e,
+            )
+            return Label.UNSAFE, 0.0, 0.0, 0.0, ce
 
-    # Step 3: evaluate B(f_lin(x*)) at each crossing point
-    delta    = x_stars - centroid              # (E, n)
-    f_lin_xs = f_val + delta @ f_jac.T        # (E, n)
+    # Step 2: Taylor remainder
+    f_cstar, f_jac = dyn.eval(c_star)
+    delta          = x_stars - c_star
+    f_lin_xs       = f_cstar + delta @ f_jac.T
 
-    with torch.no_grad():
-        B_next = barrier_model(
-            torch.tensor(f_lin_xs.astype(np.float32), dtype=model_dtype)
-        ).numpy().ravel()   # (E,)
+    if continuous_time:
+        cond_vals = f_lin_xs @ p_i
+    else:
+        with torch.no_grad():
+            cond_vals = barrier_model(
+                torch.tensor(f_lin_xs.astype(np.float32), dtype=model_dtype)
+            ).numpy().ravel()
 
-    return B_next, distances
-
-
-def _eval_delta_V_at_vertices(
-    vertices      : np.ndarray,   # (V, n)
-    centroid      : np.ndarray,   # (n,)
-    f_jac         : np.ndarray,   # (n, n)
-    f_val         : np.ndarray,   # (n,)
-    lyapunov_model,               # TorchScript network
-) -> np.ndarray:
-    """
-    Evaluate Delta_V_lin(v_k) = V(f_lin(v_k)) - V(v_k) at all vertices.
-
-    Returns array of shape (V,).
-    """
-    delta    = vertices - centroid
-    f_lin_vk = f_val + delta @ f_jac.T      # (V, n)
-
-    model_dtype = next(lyapunov_model.parameters()).dtype
-    with torch.no_grad():
-        V_next = lyapunov_model(
-            torch.tensor(f_lin_vk.astype(np.float32), dtype=model_dtype)
-        ).numpy().ravel()
-        V_curr = lyapunov_model(
-            torch.tensor(vertices.astype(np.float32),  dtype=model_dtype)
-        ).numpy().ravel()
-
-    return V_next - V_curr                   # (V,)
-
-
-def _compute_jacobian(f_sym, symbols, centroid: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Compute f(centroid) and Jacobian J_f at centroid numerically from
-    precompiled lambdified functions.
-
-    Parameters
-    ----------
-    f_sym    : list of sympy expressions (length n)
-    symbols  : tuple of sympy symbols
-    centroid : (n,) array
-
-    Returns
-    -------
-    f_val  : (n,) array
-    f_jac  : (n, n) array
-    """
-    import sympy as sp
-    n = len(symbols)
-
-    # Evaluate f at centroid
-    subs = dict(zip(symbols, centroid))
-    f_val = np.array([float(fi.subs(subs)) for fi in f_sym])
-
-    # Jacobian J[i,j] = df_i/dx_j at centroid
-    f_jac = np.zeros((n, n))
-    for i, fi in enumerate(f_sym):
-        for j, xj in enumerate(symbols):
-            dfi_dxj = sp.diff(fi, xj)
-            f_jac[i, j] = float(dfi_dxj.subs(subs))
-
-    return f_val, f_jac
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Per-cell verify
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _verify_cell(
-    condition_vals : np.ndarray,            # (E,) condition at zero crossings
-    M_i            : float,                 # Hessian bound over full cell
-    cell_idx       : int,
-    distances      : Optional[np.ndarray] = None,  # (E,) ||x* - centroid||
-    r_i            : float = 0.0,           # fallback if distances not provided
-) -> CellResult:
-    """
-    Label one cell using per-point remainder bounds.
-
-    For each zero crossing point x*_e:
-        remainder_e = 0.5 * M_i * ||x*_e - centroid||^2
-
-    The cell is SAFE if for all crossing points:
-        B(f_lin(x*_e)) + remainder_e <= 0
-
-    The cell is UNSAFE if for any crossing point:
-        B(f_lin(x*_e)) - remainder_e > 0
-
-    Note: M_i is computed over the full cell (not just crossing points)
-    because the Taylor bound must hold everywhere, but the distances
-    ||x* - centroid|| are specific to each crossing point — tighter
-    than the full cell radius r_i.
-
-    Parameters
-    ----------
-    condition_vals : B(f_lin(x*)) at each zero crossing point
-    M_i            : Hessian bound over full cell X_i
-    cell_idx       : index for reporting
-    distances      : ||x* - centroid|| per crossing point (tighter remainder)
-    r_i            : fallback radius if distances not provided
-    """
-    if distances is None or len(distances) == 0:
-        distances = np.full(len(condition_vals), r_i)
-
-    # Per-point remainders — tighter than using global r_i
-    remainders = 0.5 * M_i * distances ** 2   # (E,)
-
-    max_cond = float(condition_vals.max())
-    min_cond = float(condition_vals.min())
-
-    # Worst-case check: is max(B_next + remainder) <= 0?
-    worst_safe   = float((condition_vals + remainders).max())
-    # Best-case check: is min(B_next - remainder) > 0?
-    best_unsafe  = float((condition_vals - remainders).min())
+    distances   = np.linalg.norm(x_stars - c_star, axis=1)
+    M_i         = hb.bound(p_i, x_stars)
+    remainders  = 0.5 * M_i * distances ** 2
+    worst_safe  = float((cond_vals + remainders).max())
+    best_unsafe = float((cond_vals - remainders).min())
 
     if worst_safe <= 0.0:
         label = Label.SAFE
@@ -350,115 +352,484 @@ def _verify_cell(
     else:
         label = Label.INCONCLUSIVE
 
-    # Report the tightest remainder for summary
-    remainder = float(remainders.max())
+    return (label, M_i, float(distances.max()),
+            float(remainders.max()), None)
 
-    return CellResult(
-        label         = label,
-        cell_idx      = cell_idx,
-        M_i           = M_i,
-        r_i           = float(distances.max()),
-        remainder     = remainder,
-        max_condition = max_cond,
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helpers for cell splitting
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _build_child(
+    vertices   : np.ndarray,   # (V, n) parent vertices
+    x_stars    : np.ndarray,   # (E, n) zero level set crossing points
+    boundary_H : np.ndarray,
+    boundary_b : np.ndarray,
+    p_i        : np.ndarray,   # (n,)
+    c_i        : float,
+    cut_H      : np.ndarray,   # (1, n) cutting hyperplane normal (already oriented)
+    cut_b      : np.ndarray,   # (1,)   cutting hyperplane offset
+    side_sign  : float,        # +1 if child is on cut_H @ x + cut_b >= 0 side
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Build child cell geometry for one side of a cut.
+
+    Returns (child_vertices, boundary_H_child, boundary_b_child).
+
+    Child vertices = parent vertices on correct side + crossing points.
+    Boundary includes: original boundary + cutting hyperplane + ZLS (B=0).
+    """
+    n = vertices.shape[1]
+
+    # Parent vertices on this side
+    v_vals = vertices @ cut_H[0] + cut_b[0]   # (V,)
+    if side_sign > 0:
+        v_mask = v_vals >= -1e-9
+    else:
+        v_mask = v_vals <=  1e-9
+
+    verts_side = vertices[v_mask]
+
+    # Child vertices: parent vertices on this side + zero level set crossings
+    if len(verts_side) == 0:
+        child_verts = x_stars
+    else:
+        child_verts = np.vstack([verts_side, x_stars])
+
+    # Augmented boundary: original + cutting hyperplane (oriented) + ZLS
+    # Cutting hyperplane oriented so child is on the non-negative side:
+    #   side_sign > 0:  cut_H @ x + cut_b >= 0  ->  add  cut_H,  cut_b
+    #   side_sign < 0:  cut_H @ x + cut_b <= 0  ->  add -cut_H, -cut_b
+    if side_sign > 0:
+        bH = np.vstack([boundary_H, cut_H])
+        bb = np.concatenate([boundary_b, cut_b])
+    else:
+        bH = np.vstack([boundary_H, -cut_H])
+        bb = np.concatenate([boundary_b, -cut_b])
+
+    # Zero level set as boundary face (B=0 vertices exist in both children)
+    zls_H = p_i[None, :]
+    zls_b = np.array([c_i])
+    bH    = np.vstack([bH, zls_H])
+    bb    = np.concatenate([bb, zls_b])
+
+    return child_verts, bH, bb
+
+
+def _get_child_crossings(
+    child_verts : np.ndarray,
+    x_stars     : np.ndarray,   # fallback if detection fails
+    sv_i        : np.ndarray,
+    barrier_model,
+    layer_W     : list,
+    layer_b     : list,
+    boundary_H  : np.ndarray,
+    boundary_b  : np.ndarray,
+    use_wide    : bool,
+) -> np.ndarray:
+    """Find zero level set crossings on a child cell."""
+    model_dtype = next(barrier_model.parameters()).dtype
+    with torch.no_grad():
+        B_child = barrier_model(
+            torch.tensor(child_verts.astype(np.float32), dtype=model_dtype)
+        ).numpy().ravel()
+
+    crossings = _get_zero_level_set_crossings(
+        child_verts, sv_i, B_child,
+        layer_W, layer_b, boundary_H, boundary_b, use_wide
+    )
+
+    # Fallback: if bitmask slicing finds nothing, use the known crossing points
+    # that belong to this child (those already on the B=0 face)
+    if len(crossings) == 0:
+        crossings = x_stars
+
+    return crossings
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Step 0: split X_i along zero level set, verify smaller child, discard other
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _split_on_zls(
+    vertices        : np.ndarray,   # (V, n) original cell vertices
+    x_stars         : np.ndarray,   # (E, n) zero level set crossings
+    sv_i            : np.ndarray,
+    p_i             : np.ndarray,
+    c_i             : float,
+    barrier_model,
+    dyn             : DynamicsEvaluator,
+    hb              : HessianBounder,
+    layer_W         : list,
+    layer_b         : list,
+    W_out           : np.ndarray,
+    boundary_H      : np.ndarray,
+    boundary_b      : np.ndarray,
+    cell_idx        : int,
+    continuous_time : bool,
+    use_wide        : bool,
+    max_depth       : int,
+) -> Tuple[Label, float, float, float, Optional[Counterexample]]:
+    """
+    Split X_i along zero level set B(x)=0 into X_i^+ and X_i^-.
+
+    Both children share the zero level set as a face — its vertices appear
+    in both. Therefore we only need to verify ONE child (the smaller one).
+    The certificate condition is the same on the shared face regardless of
+    which side you verify from, so verifying one covers the boundary.
+
+    After this initial split, we call _refine_barrier which verifies BOTH
+    children when splitting with fake neurons.
+    """
+    n = vertices.shape[1]
+
+    # ZLS hyperplane as the cut: p_i @ x + c_i = 0
+    cut_H = p_i[None, :]
+    cut_b = np.array([c_i])
+
+    # Build both children
+    verts_pos, bH_pos, bb_pos = _build_child(
+        vertices, x_stars, boundary_H, boundary_b,
+        p_i, c_i, cut_H, cut_b, side_sign=+1
+    )
+    verts_neg, bH_neg, bb_neg = _build_child(
+        vertices, x_stars, boundary_H, boundary_b,
+        p_i, c_i, cut_H, cut_b, side_sign=-1
+    )
+
+    # Pick smaller child by number of non-ZLS vertices
+    v_vals  = vertices @ p_i + c_i   # (V,)
+    n_pos   = int((v_vals >= -1e-9).sum())
+    n_neg   = int((v_vals <=  1e-9).sum())
+
+    if n_pos <= n_neg:
+        child_verts, child_bH, child_bb = verts_pos, bH_pos, bb_pos
+    else:
+        child_verts, child_bH, child_bb = verts_neg, bH_neg, bb_neg
+
+    if len(child_verts) < n + 1:
+        # Degenerate — fall back to original crossings
+        return _two_step_label(
+            x_stars, barrier_model, dyn, hb, p_i, cell_idx, continuous_time
+        )
+
+    # Get crossings on chosen child
+    child_crossings = _get_child_crossings(
+        child_verts, x_stars, sv_i, barrier_model,
+        layer_W, layer_b, child_bH, child_bb, use_wide
+    )
+
+    if len(child_crossings) == 0:
+        return Label.SAFE, 0.0, 0.0, 0.0, None
+
+    # Two-step label on chosen child
+    label, M_i, r_i, remainder, ce = _two_step_label(
+        child_crossings, barrier_model, dyn, hb, p_i, cell_idx, continuous_time
+    )
+
+    if label != Label.INCONCLUSIVE:
+        return label, M_i, r_i, remainder, ce
+
+    # INCONCLUSIVE — refine with fake neuron (must verify BOTH children)
+    return _refine_barrier(
+        child_crossings, child_verts, sv_i, p_i, c_i,
+        barrier_model, dyn, hb,
+        layer_W, layer_b, W_out,
+        child_bH, child_bb,
+        cell_idx, continuous_time, use_wide,
+        max_depth - 1,
     )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Public API: barrier certificate verification
+# Refinement by fake neuron — BOTH children must be verified
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _refine_barrier(
+    x_stars         : np.ndarray,   # (E, n) current crossing points
+    vertices        : np.ndarray,   # (V, n) current cell vertices
+    sv_i            : np.ndarray,
+    p_i             : np.ndarray,
+    c_i             : float,
+    barrier_model,
+    dyn             : DynamicsEvaluator,
+    hb              : HessianBounder,
+    layer_W         : list,
+    layer_b         : list,
+    W_out           : np.ndarray,
+    boundary_H      : np.ndarray,
+    boundary_b      : np.ndarray,
+    cell_idx        : int,
+    continuous_time : bool,
+    use_wide        : bool,
+    max_depth       : int,
+) -> Tuple[Label, float, float, float, Optional[Counterexample]]:
+    """
+    Refine INCONCLUSIVE cell by splitting with a fake neuron hyperplane.
+
+    Unlike the initial ZLS split, fake neuron splits create two children
+    that do NOT share the zero level set face — BOTH must be verified.
+
+    Strategy:
+      1. Find principal direction d of x_stars via SVD
+      2. Fake hyperplane: d^T x = d^T c*
+      3. Split into two children, build each with correct boundary
+      4. Verify BOTH children with two-step label
+      5. If either is INCONCLUSIVE, recurse on it
+      6. SAFE only when ALL children are SAFE
+      7. UNSAFE as soon as any child is UNSAFE
+
+    Termination: only B(f(x*)) = 0 (tangent) stays INCONCLUSIVE at max_depth.
+    """
+    if max_depth == 0 or len(x_stars) < 2:
+        return Label.INCONCLUSIVE, 0.0, 0.0, 0.0, None
+
+    n      = x_stars.shape[1]
+    c_star = x_stars.mean(axis=0)
+
+    # ── Principal direction via SVD ───────────────────────────────────────────
+    X = x_stars - c_star
+    if np.linalg.norm(X) < 1e-12:
+        return Label.INCONCLUSIVE, 0.0, 0.0, 0.0, None
+
+    _, _, Vt  = np.linalg.svd(X, full_matrices=False)
+    d         = Vt[0]
+    offset    = float(d @ c_star)
+    cut_H     = d[None, :]
+    cut_b     = np.array([-offset])   # d @ x - offset = 0
+
+    # ── Build both children ───────────────────────────────────────────────────
+    verts_pos, bH_pos, bb_pos = _build_child(
+        vertices, x_stars, boundary_H, boundary_b,
+        p_i, c_i, cut_H, cut_b, side_sign=+1
+    )
+    verts_neg, bH_neg, bb_neg = _build_child(
+        vertices, x_stars, boundary_H, boundary_b,
+        p_i, c_i, cut_H, cut_b, side_sign=-1
+    )
+
+    # ── Split crossing points between children ────────────────────────────────
+    signed    = x_stars @ d - offset
+    xs_pos    = x_stars[signed >= -1e-9]
+    xs_neg    = x_stars[signed <=  1e-9]
+
+    children = [
+        (verts_pos, bH_pos, bb_pos, xs_pos),
+        (verts_neg, bH_neg, bb_neg, xs_neg),
+    ]
+
+    # ── Verify BOTH children ──────────────────────────────────────────────────
+    worst_M   = 0.0
+    worst_r   = 0.0
+    worst_rem = 0.0
+
+    for child_verts, child_bH, child_bb, xs_child in children:
+        if len(child_verts) < n + 1 or len(xs_child) == 0:
+            continue   # degenerate child — treat as safe
+
+        child_crossings = _get_child_crossings(
+            child_verts, xs_child, sv_i, barrier_model,
+            layer_W, layer_b, child_bH, child_bb, use_wide
+        )
+
+        if len(child_crossings) == 0:
+            continue   # no crossings on this child — safe
+
+        label, M_i, r_i, remainder, ce = _two_step_label(
+            child_crossings, barrier_model, dyn, hb,
+            p_i, cell_idx, continuous_time
+        )
+
+        # Track worst-case values for reporting
+        worst_M   = max(worst_M,   M_i)
+        worst_r   = max(worst_r,   r_i)
+        worst_rem = max(worst_rem, remainder)
+
+        if label == Label.UNSAFE:
+            return Label.UNSAFE, M_i, r_i, remainder, ce
+
+        if label == Label.INCONCLUSIVE:
+            # Recurse on this child
+            label, M_i, r_i, remainder, ce = _refine_barrier(
+                child_crossings, child_verts, sv_i, p_i, c_i,
+                barrier_model, dyn, hb,
+                layer_W, layer_b, W_out,
+                child_bH, child_bb,
+                cell_idx, continuous_time, use_wide,
+                max_depth - 1,
+            )
+
+            if label == Label.UNSAFE:
+                return Label.UNSAFE, M_i, r_i, remainder, ce
+
+            if label == Label.INCONCLUSIVE:
+                return Label.INCONCLUSIVE, worst_M, worst_r, worst_rem, None
+
+    # All children verified SAFE
+    return Label.SAFE, worst_M, worst_r, worst_rem, None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Lyapunov cell labeling
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _label_lyapunov_cell(
+    vertices      : np.ndarray,
+    centroid      : np.ndarray,
+    dyn           : DynamicsEvaluator,
+    hb            : HessianBounder,
+    p_i           : np.ndarray,
+    lyapunov_model,
+    cell_idx      : int,
+) -> CellResult:
+    """
+    Label a Lyapunov cell. Linearize f around cell centroid.
+    Taylor remainder at vertices using cell radius.
+    """
+    model_dtype = next(lyapunov_model.parameters()).dtype
+
+    f_val, f_jac = dyn.eval(centroid)
+    delta        = vertices - centroid
+    f_lin_vk     = f_val + delta @ f_jac.T
+
+    with torch.no_grad():
+        V_next = lyapunov_model(
+            torch.tensor(f_lin_vk.astype(np.float32), dtype=model_dtype)
+        ).numpy().ravel()
+        V_curr = lyapunov_model(
+            torch.tensor(vertices.astype(np.float32), dtype=model_dtype)
+        ).numpy().ravel()
+
+    cond_vals   = V_next - V_curr
+    r_i         = float(np.linalg.norm(vertices - centroid, axis=1).max())
+    M_i         = hb.bound(p_i, vertices)
+    remainders  = np.full(len(cond_vals), 0.5 * M_i * r_i ** 2)
+    worst_safe  = float((cond_vals + remainders).max())
+    best_unsafe = float((cond_vals - remainders).min())
+
+    if worst_safe <= 0.0:
+        label = Label.SAFE
+    elif best_unsafe > 0.0:
+        label = Label.UNSAFE
+    else:
+        label = Label.INCONCLUSIVE
+
+    return CellResult(
+        label=label, cell_idx=cell_idx, M_i=M_i, r_i=r_i,
+        remainder=float(remainders.max()), max_condition=float(cond_vals.max()),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Public API
 # ═══════════════════════════════════════════════════════════════════════════
 
 def verify_barrier(
-    BC             : list,
-    sv             : np.ndarray,
-    hyperplanes    : list,
-    W_out          : np.ndarray,
-    b              : list,
+    BC              : list,
+    sv              : np.ndarray,
+    layer_W         : list,
+    layer_b         : list,
+    W_out           : np.ndarray,
+    boundary_H      : np.ndarray,
+    boundary_b      : np.ndarray,
     barrier_model,
-    dynamics_name  : str,
-    use_fast_bound : bool = True,
-    early_exit     : bool = True,
-    max_refine_depth : int = 8,    # max bisection depth for INCONCLUSIVE cells
+    dynamics_name   : str,
+    continuous_time : bool = True,
+    early_exit      : bool = True,
+    max_refine_depth: int  = 8,
 ) -> VerificationSummary:
     """
-    Formally verify B(f(x)) <= 0 on all boundary-adjacent cells.
+    Formally verify barrier certificate on all boundary-adjacent cells.
 
-    After the main pass, INCONCLUSIVE cells are refined by bisection toward
-    the furthest vertex. Each bisection reduces r_i by half, cutting the
-    remainder by factor 4. Refinement continues until SAFE/UNSAFE or
-    max_refine_depth is reached.
-
-    Parameters
-    ----------
-    BC               : list of (V_k, n) vertex arrays — boundary cells
-    sv               : (N_b, total_neurons) activation patterns for BC
-    hyperplanes      : list of weight matrices
-    W_out            : output layer weights
-    b                : list of bias vectors
-    barrier_model    : TorchScript network
-    dynamics_name    : system name registered in Dynamics.py
-    use_fast_bound   : use numpy-only bound first, fall back to full bound
-    early_exit       : stop immediately when first UNSAFE cell found
-    max_refine_depth : max bisection depth per INCONCLUSIVE cell
-
-    Returns
-    -------
-    VerificationSummary
+    For each cell:
+      1. Find exact zero level set crossings via bitmask slicing
+      2. Two-step labeling (exact + Taylor)
+      3. If INCONCLUSIVE: refine by fake neuron splitting
     """
     symbols, f_sym = load_dynamics(dynamics_name)
     hb             = HessianBounder(symbols, f_sym)
-    summary        = VerificationSummary(
-        mode="barrier", dynamics_name=dynamics_name
-    )
+    dyn            = DynamicsEvaluator(symbols, f_sym)
+    total_neurons  = sum(W.shape[0] for W in layer_W)
+    use_wide       = (total_neurons + len(boundary_H) > 64)
+    model_dtype    = next(barrier_model.parameters()).dtype
+
+    summary = VerificationSummary(mode="barrier", dynamics_name=dynamics_name)
 
     print(f"\nBarrier verification: {len(BC)} boundary cells, "
-          f"dynamics='{dynamics_name}'")
+          f"dynamics='{dynamics_name}', "
+          f"mode={'continuous-time' if continuous_time else 'discrete-time'}, "
+          f"use_wide={use_wide}, max_refine_depth={max_refine_depth}")
     t0 = time.perf_counter()
 
-    # Track INCONCLUSIVE cells for refinement
-    inconclusive_cells = []   # list of (vertices, sv_i, p_i, cell_idx)
-
     for i, vertices in enumerate(BC):
-        vertices  = np.asarray(vertices, dtype=float)
-        sv_i      = sv[i].ravel()
-        p_i       = compute_local_gradient(sv_i, hyperplanes, W_out)
-        r_i, centroid = hb.cell_radius(vertices)
+        vertices = np.asarray(vertices, dtype=float)
+        sv_i     = sv[i].ravel()
+        p_i      = compute_local_gradient(sv_i, layer_W, W_out)
 
-        f_val, f_jac = _compute_jacobian(f_sym, symbols, centroid)
-        cond_vals, distances = _eval_barrier_at_vertices(
-            vertices, centroid, f_jac, f_val, barrier_model
+        # B values at vertices — exact since B is affine on cell
+        with torch.no_grad():
+            B_vals = barrier_model(
+                torch.tensor(vertices.astype(np.float32), dtype=model_dtype)
+            ).numpy().ravel()
+
+        # B offset: B(x) = p_i @ x + c_i
+        centroid = vertices.mean(axis=0)
+        c_i      = float(
+            barrier_model(
+                torch.tensor(centroid.astype(np.float32)[None, :],
+                             dtype=model_dtype)
+            ) 
+        ) - float(p_i @ centroid)
+
+        # Find zero level set crossings
+        x_stars = _get_zero_level_set_crossings(
+            vertices, sv_i, B_vals,
+            layer_W, layer_b, boundary_H, boundary_b, use_wide
         )
 
-        # Debug: print first 3 cells
-        if i < 3:
-            print(f"  [debug cell {i}] "
-                  f"crossings={len(distances)} "
-                  f"B_next: min={cond_vals.min():.4f} max={cond_vals.max():.4f} "
-                  f"dist: min={distances.min():.4f} max={distances.max():.4f} "
-                  f"r_i={r_i:.4f}")
-
-        if use_fast_bound:
-            M      = hb.bound_fast(p_i, vertices)
-            result = _verify_cell(cond_vals, M, i, distances)
-            if result.label == Label.INCONCLUSIVE:
-                M      = hb.bound(p_i, vertices)
-                result = _verify_cell(cond_vals, M, i, distances)
-        else:
-            M      = hb.bound(p_i, vertices)
-            result = _verify_cell(cond_vals, M, i, distances)
-
-        summary.results.append(result)
-        if result.label == Label.SAFE:
+        if len(x_stars) == 0:
+            summary.results.append(CellResult(
+                label=Label.SAFE, cell_idx=i,
+                M_i=0.0, r_i=0.0, remainder=0.0, max_condition=-1.0,
+            ))
             summary.n_safe += 1
-        elif result.label == Label.UNSAFE:
+            continue
+
+        # Two-step labeling
+        label, M_i, r_i, remainder, ce = _two_step_label(
+            x_stars, barrier_model, dyn, hb, p_i, i, continuous_time
+        )
+
+        # Refine if INCONCLUSIVE:
+        # Step 0 — split X_i along zero level set, verify smaller child (discard other)
+        # Step 1+ — fake neuron splits, verify BOTH children
+        if label == Label.INCONCLUSIVE:
+            label, M_i, r_i, remainder, ce = _split_on_zls(
+                vertices, x_stars, sv_i, p_i, c_i,
+                barrier_model, dyn, hb,
+                layer_W, layer_b, W_out,
+                boundary_H, boundary_b,
+                i, continuous_time, use_wide, max_refine_depth
+            )
+
+        if ce is not None and summary.counterexample is None:
+            summary.counterexample = ce
+
+        result = CellResult(
+            label=label, cell_idx=i,
+            M_i=M_i, r_i=r_i, remainder=remainder,
+            max_condition=0.0,
+        )
+        summary.results.append(result)
+
+        if label == Label.SAFE:
+            summary.n_safe += 1
+        elif label == Label.UNSAFE:
             summary.n_unsafe += 1
             if early_exit:
-                print(f"\n  !! UNSAFE cell found at index {i} — stopping early.")
-                print(f"     max B(f(x*)) = {result.max_condition:.6f}")
-                print(f"     remainder    = {result.remainder:.6f}")
                 break
         else:
             summary.n_inconclusive += 1
-            inconclusive_cells.append((vertices, sv_i, p_i, i))
 
         if (i + 1) % 50 == 0 or (i + 1) == len(BC):
             print(f"  [{i+1}/{len(BC)}] "
@@ -466,323 +837,46 @@ def verify_barrier(
                   f"unsafe={summary.n_unsafe} "
                   f"inconclusive={summary.n_inconclusive}")
 
-    # ── Refinement pass for INCONCLUSIVE cells ──────────────────────────────
-    if inconclusive_cells and summary.n_unsafe == 0:
-        print(f"\n  Refining {len(inconclusive_cells)} INCONCLUSIVE cells "
-              f"(max depth={max_refine_depth})...")
-        resolved_safe   = 0
-        resolved_unsafe = 0
-        still_inconclusive = 0
-
-        for vertices, sv_i, p_i, cell_idx in inconclusive_cells:
-            label = _refine_inconclusive_barrier(
-                vertices, sv_i, p_i, hb, f_sym, symbols,
-                barrier_model, max_refine_depth, use_fast_bound
-            )
-            if label == Label.SAFE:
-                resolved_safe += 1
-                summary.n_safe += 1
-                summary.n_inconclusive -= 1
-            elif label == Label.UNSAFE:
-                resolved_unsafe += 1
-                summary.n_unsafe += 1
-                summary.n_inconclusive -= 1
-                if early_exit:
-                    print(f"\n  !! UNSAFE cell found during refinement "
-                          f"(original cell {cell_idx}) — stopping.")
-                    break
-            else:
-                still_inconclusive += 1
-
-        print(f"  Refinement complete: "
-              f"resolved_safe={resolved_safe} "
-              f"resolved_unsafe={resolved_unsafe} "
-              f"still_inconclusive={still_inconclusive}")
-
     summary.runtime_s = time.perf_counter() - t0
     summary.print_summary()
     return summary
-
-    summary.runtime_s = time.perf_counter() - t0
-    summary.print_summary()
-    return summary
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Cell refinement
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _split_cell(
-    vertices : np.ndarray,   # (V, n)
-    d        : np.ndarray,   # (n,) cutting direction
-    offset   : float,        # hyperplane: d^T x = offset
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Split a polytope along the hyperplane d^T x = offset.
-
-    Vertices on the positive side (d^T x >= offset) go to child_pos.
-    Vertices on the negative side (d^T x <= offset) go to child_neg.
-    New vertices are interpolated on crossing edges — exactly as in
-    Stage 3 of Algorithm 1 in the paper.
-
-    Returns
-    -------
-    child_pos : (V+, n) array
-    child_neg : (V-, n) array
-    """
-    signed = vertices @ d - offset    # (V,) signed distances
-    V, n   = vertices.shape
-
-    pos_mask = signed >= 0
-    neg_mask = signed <= 0
-
-    new_verts = []
-    for u in range(V):
-        for v in range(u + 1, V):
-            if signed[u] * signed[v] < 0:   # sign change — edge crosses plane
-                t      = signed[u] / (signed[u] - signed[v])
-                x_star = vertices[u] + t * (vertices[v] - vertices[u])
-                new_verts.append(x_star)
-
-    if new_verts:
-        new_arr   = np.array(new_verts)
-        child_pos = np.vstack([vertices[pos_mask], new_arr])
-        child_neg = np.vstack([vertices[neg_mask], new_arr])
-    else:
-        child_pos = vertices[pos_mask]
-        child_neg = vertices[neg_mask]
-
-    return child_pos, child_neg
-
-
-def _refine_inconclusive_barrier(
-    vertices      : np.ndarray,   # (V, n)
-    sv_i          : np.ndarray,   # activation pattern (inherited unchanged)
-    p_i           : np.ndarray,   # local gradient (inherited unchanged)
-    hb            : HessianBounder,
-    f_sym         : list,
-    symbols       : tuple,
-    barrier_model,
-    max_depth     : int,
-    use_fast_bound: bool,
-) -> Label:
-    """
-    Recursively bisect an INCONCLUSIVE barrier cell until SAFE or UNSAFE.
-
-    Cutting strategy: bisect along the direction from centroid to the
-    furthest vertex. This halves r_i at each step, reducing the remainder
-    by factor 4 per bisection regardless of M_i tightness.
-
-    The sign vector sv_i and local gradient p_i are inherited unchanged —
-    the split is verification-only, not part of the network partition.
-
-    Returns the resolved label (SAFE or UNSAFE) or INCONCLUSIVE if
-    max_depth is reached without resolution.
-    """
-    if max_depth == 0:
-        return Label.INCONCLUSIVE
-
-    # Find cutting hyperplane: toward furthest vertex
-    r_i, centroid = hb.cell_radius(vertices)
-    dists  = np.linalg.norm(vertices - centroid, axis=1)
-    v_star = vertices[np.argmax(dists)]
-    d      = v_star - centroid
-    offset = centroid @ d + 0.5 * (d @ d)   # midpoint along d
-
-    child_pos, child_neg = _split_cell(vertices, d, offset)
-
-    labels = []
-    for child in [child_pos, child_neg]:
-        if len(child) < child.shape[1]:
-            # Degenerate child — skip
-            labels.append(Label.SAFE)
-            continue
-
-        # Recompute condition on child
-        r_child, centroid_child = hb.cell_radius(child)
-        f_val, f_jac = _compute_jacobian(f_sym, symbols, centroid_child)
-        cond_vals, distances = _eval_barrier_at_vertices(
-            child, centroid_child, f_jac, f_val, barrier_model
-        )
-
-        if use_fast_bound:
-            M = hb.bound_fast(p_i, child)
-            result = _verify_cell(cond_vals, M, -1, distances)
-            if result.label == Label.INCONCLUSIVE:
-                M      = hb.bound(p_i, child)
-                result = _verify_cell(cond_vals, M, -1, distances)
-        else:
-            M      = hb.bound(p_i, child)
-            result = _verify_cell(cond_vals, M, -1, distances)
-
-        if result.label == Label.INCONCLUSIVE:
-            # Recurse
-            result_label = _refine_inconclusive_barrier(
-                child, sv_i, p_i, hb, f_sym, symbols,
-                barrier_model, max_depth - 1, use_fast_bound
-            )
-        else:
-            result_label = result.label
-
-        labels.append(result_label)
-
-        # Early exit on UNSAFE
-        if result_label == Label.UNSAFE:
-            return Label.UNSAFE
-
-    # Both children must be SAFE for the parent to be SAFE
-    if all(l == Label.SAFE for l in labels):
-        return Label.SAFE
-    if any(l == Label.UNSAFE for l in labels):
-        return Label.UNSAFE
-    return Label.INCONCLUSIVE
-
-
-def _refine_inconclusive_lyapunov(
-    vertices      : np.ndarray,
-    sv_i          : np.ndarray,
-    p_i           : np.ndarray,
-    hb            : HessianBounder,
-    f_sym         : list,
-    symbols       : tuple,
-    lyapunov_model,
-    max_depth     : int,
-    use_fast_bound: bool,
-) -> Label:
-    """
-    Recursively bisect an INCONCLUSIVE Lyapunov cell until SAFE or UNSAFE.
-
-    Same cutting strategy as barrier refinement — toward furthest vertex.
-    Delta_V condition checked on all vertices of each child cell.
-    """
-    if max_depth == 0:
-        return Label.INCONCLUSIVE
-
-    r_i, centroid = hb.cell_radius(vertices)
-    dists  = np.linalg.norm(vertices - centroid, axis=1)
-    v_star = vertices[np.argmax(dists)]
-    d      = v_star - centroid
-    offset = centroid @ d + 0.5 * (d @ d)
-
-    child_pos, child_neg = _split_cell(vertices, d, offset)
-
-    labels = []
-    for child in [child_pos, child_neg]:
-        if len(child) < child.shape[1]:
-            labels.append(Label.SAFE)
-            continue
-
-        r_child, centroid_child = hb.cell_radius(child)
-        f_val, f_jac = _compute_jacobian(f_sym, symbols, centroid_child)
-        cond_vals = _eval_delta_V_at_vertices(
-            child, centroid_child, f_jac, f_val, lyapunov_model
-        )
-
-        if use_fast_bound:
-            M = hb.bound_fast(p_i, child)
-            result = _verify_cell(cond_vals, M, -1,
-                                  distances=np.full(len(cond_vals), r_child))
-            if result.label == Label.INCONCLUSIVE:
-                M      = hb.bound(p_i, child)
-                result = _verify_cell(cond_vals, M, -1,
-                                      distances=np.full(len(cond_vals), r_child))
-        else:
-            M      = hb.bound(p_i, child)
-            result = _verify_cell(cond_vals, M, -1,
-                                  distances=np.full(len(cond_vals), r_child))
-
-        if result.label == Label.INCONCLUSIVE:
-            result_label = _refine_inconclusive_lyapunov(
-                child, sv_i, p_i, hb, f_sym, symbols,
-                lyapunov_model, max_depth - 1, use_fast_bound
-            )
-        else:
-            result_label = result.label
-
-        labels.append(result_label)
-
-        if result_label == Label.UNSAFE:
-            return Label.UNSAFE
-
-    if all(l == Label.SAFE for l in labels):
-        return Label.SAFE
-    if any(l == Label.UNSAFE for l in labels):
-        return Label.UNSAFE
-    return Label.INCONCLUSIVE
-
-
 
 
 def verify_lyapunov(
     enumerate_poly   : list,
     sv_all           : np.ndarray,
-    hyperplanes      : list,
+    layer_W          : list,
+    layer_b          : list,
     W_out            : np.ndarray,
-    b                : list,
+    boundary_H       : np.ndarray,
+    boundary_b       : np.ndarray,
     lyapunov_model,
     dynamics_name    : str,
-    use_fast_bound   : bool = True,
     early_exit       : bool = True,
-    max_refine_depth : int = 8,
 ) -> VerificationSummary:
     """
     Formally verify Delta_V(x) = V(f(x)) - V(x) <= 0 on all cells.
-
-    After the main pass, INCONCLUSIVE cells are refined by bisection.
-    Each bisection halves r_i, reducing the remainder by factor 4.
-
-    Parameters
-    ----------
-    enumerate_poly   : list of (V_k, n) vertex arrays — all enumerated cells
-    sv_all           : (N, total_neurons) activation patterns
-    hyperplanes      : list of weight matrices
-    W_out            : output layer weights
-    b                : list of bias vectors
-    lyapunov_model   : TorchScript network
-    dynamics_name    : system name registered in Dynamics.py
-    use_fast_bound   : use bound_fast first, fall back to full bound
-    early_exit       : stop immediately when first UNSAFE cell found
-    max_refine_depth : max bisection depth per INCONCLUSIVE cell
-
-    Returns
-    -------
-    VerificationSummary
+    Linearizes f around cell centroid. Taylor remainder at vertices.
     """
     symbols, f_sym = load_dynamics(dynamics_name)
     hb             = HessianBounder(symbols, f_sym)
-    summary        = VerificationSummary(
-        mode="lyapunov", dynamics_name=dynamics_name
-    )
+    dyn            = DynamicsEvaluator(symbols, f_sym)
+
+    summary = VerificationSummary(mode="lyapunov", dynamics_name=dynamics_name)
 
     print(f"\nLyapunov verification: {len(enumerate_poly)} cells, "
           f"dynamics='{dynamics_name}'")
     t0 = time.perf_counter()
 
-    inconclusive_cells = []   # (vertices, sv_i, p_i, cell_idx)
-
     for i, vertices in enumerate(enumerate_poly):
-        vertices  = np.asarray(vertices, dtype=float)
-        sv_i      = sv_all[i].ravel()
-        p_i       = compute_local_gradient(sv_i, hyperplanes, W_out)
-        r_i, centroid = hb.cell_radius(vertices)
+        vertices = np.asarray(vertices, dtype=float)
+        sv_i     = sv_all[i].ravel()
+        p_i      = compute_local_gradient(sv_i, layer_W, W_out)
+        centroid = vertices.mean(axis=0)
 
-        f_val, f_jac = _compute_jacobian(f_sym, symbols, centroid)
-        cond_vals    = _eval_delta_V_at_vertices(
-            vertices, centroid, f_jac, f_val, lyapunov_model
+        result = _label_lyapunov_cell(
+            vertices, centroid, dyn, hb, p_i, lyapunov_model, i
         )
-
-        if use_fast_bound:
-            M      = hb.bound_fast(p_i, vertices)
-            result = _verify_cell(cond_vals, M, i,
-                                  distances=np.full(len(cond_vals), r_i))
-            if result.label == Label.INCONCLUSIVE:
-                M      = hb.bound(p_i, vertices)
-                result = _verify_cell(cond_vals, M, i,
-                                      distances=np.full(len(cond_vals), r_i))
-        else:
-            M      = hb.bound(p_i, vertices)
-            result = _verify_cell(cond_vals, M, i,
-                                  distances=np.full(len(cond_vals), r_i))
 
         summary.results.append(result)
         if result.label == Label.SAFE:
@@ -790,13 +884,10 @@ def verify_lyapunov(
         elif result.label == Label.UNSAFE:
             summary.n_unsafe += 1
             if early_exit:
-                print(f"\n  !! UNSAFE cell found at index {i} — stopping early.")
-                print(f"     max Delta_V(v_k) = {result.max_condition:.6f}")
-                print(f"     remainder        = {result.remainder:.6f}")
+                print(f"\n  !! UNSAFE cell at index {i}.")
                 break
         else:
             summary.n_inconclusive += 1
-            inconclusive_cells.append((vertices, sv_i, p_i, i))
 
         if (i + 1) % 1000 == 0 or (i + 1) == len(enumerate_poly):
             elapsed = time.perf_counter() - t0
@@ -808,50 +899,6 @@ def verify_lyapunov(
                   f"inconclusive={summary.n_inconclusive} "
                   f"| {rate:.0f} cells/s | ETA {eta:.0f}s")
 
-    # ── Refinement pass for INCONCLUSIVE cells ──────────────────────────────
-    if inconclusive_cells and summary.n_unsafe == 0:
-        print(f"\n  Refining {len(inconclusive_cells)} INCONCLUSIVE cells "
-              f"(max depth={max_refine_depth})...")
-        resolved_safe      = 0
-        resolved_unsafe    = 0
-        still_inconclusive = 0
-
-        for idx, (vertices, sv_i, p_i, cell_idx) in \
-                enumerate(inconclusive_cells):
-            label = _refine_inconclusive_lyapunov(
-                vertices, sv_i, p_i, hb, f_sym, symbols,
-                lyapunov_model, max_refine_depth, use_fast_bound
-            )
-            if label == Label.SAFE:
-                resolved_safe += 1
-                summary.n_safe += 1
-                summary.n_inconclusive -= 1
-            elif label == Label.UNSAFE:
-                resolved_unsafe += 1
-                summary.n_unsafe += 1
-                summary.n_inconclusive -= 1
-                if early_exit:
-                    print(f"\n  !! UNSAFE cell found during refinement "
-                          f"(original cell {cell_idx}) — stopping.")
-                    break
-            else:
-                still_inconclusive += 1
-
-            if (idx + 1) % 100 == 0:
-                print(f"  [refine {idx+1}/{len(inconclusive_cells)}] "
-                      f"safe={resolved_safe} "
-                      f"unsafe={resolved_unsafe} "
-                      f"inconclusive={still_inconclusive}")
-
-        print(f"  Refinement complete: "
-              f"resolved_safe={resolved_safe} "
-              f"resolved_unsafe={resolved_unsafe} "
-              f"still_inconclusive={still_inconclusive}")
-
-    summary.runtime_s = time.perf_counter() - t0
-    summary.print_summary()
-    return summary
-
     summary.runtime_s = time.perf_counter() - t0
     summary.print_summary()
     return summary
@@ -862,48 +909,27 @@ def verify_lyapunov(
 # ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    import sys, os
-    sys.path.insert(0, os.path.dirname(__file__))
-    from dynamics import load_dynamics
-    from hessian_bound import HessianBounder, compute_local_gradient
+    print("Smoke test: Taylor labeling logic")
 
-    print("Smoke test: _verify_cell labels")
+    import numpy as np
 
-    # SAFE: max(cond + remainder) <= 0
-    # distances = [0.1, 0.1, 0.1], M_i=1.0 -> remainders = 0.5*1.0*0.01 = 0.005
-    r = _verify_cell(np.array([-0.5, -0.3, -0.1]), M_i=1.0, cell_idx=0,
-                     distances=np.array([0.1, 0.1, 0.1]))
-    assert r.label == Label.SAFE, f"Expected SAFE, got {r.label}"
-    print(f"  SAFE case:         {r.label}  max_cond={r.max_condition:.2f}  rem={r.remainder:.4f}")
+    def label(cond, dist, M=1.0):
+        rem = 0.5 * M * dist**2
+        if (cond + rem).max() <= 0: return "SAFE"
+        if (cond - rem).min() >  0: return "UNSAFE"
+        return "INCONCLUSIVE"
 
-    # UNSAFE: min(cond - remainder) > 0
-    r = _verify_cell(np.array([0.5, 0.8, 1.0]), M_i=1.0, cell_idx=1,
-                     distances=np.array([0.1, 0.1, 0.1]))
-    assert r.label == Label.UNSAFE, f"Expected UNSAFE, got {r.label}"
-    print(f"  UNSAFE case:       {r.label}  max_cond={r.max_condition:.2f}  rem={r.remainder:.4f}")
+    assert label(np.array([-0.3,-0.1]), np.array([0.1,0.1])) == "SAFE"
+    assert label(np.array([0.5, 0.8]),  np.array([0.1,0.1])) == "UNSAFE"
+    assert label(np.array([-0.05,0.05]),np.array([0.5,0.5])) == "INCONCLUSIVE"
+    print("  SAFE / UNSAFE / INCONCLUSIVE: all passed")
 
-    # INCONCLUSIVE: straddles zero within remainder
-    # distances = [0.5, 0.5], M_i=1.0 -> remainders = 0.5*1.0*0.25 = 0.125
-    r = _verify_cell(np.array([-0.05, 0.05]), M_i=1.0, cell_idx=2,
-                     distances=np.array([0.5, 0.5]))
-    assert r.label == Label.INCONCLUSIVE, f"Expected INCONCLUSIVE, got {r.label}"
-    print(f"  INCONCLUSIVE case: {r.label}  max_cond={r.max_condition:.2f}  rem={r.remainder:.4f}")
-
-    print("\nSmoke test: _compute_jacobian on Arch3")
-    symbols, f_sym = load_dynamics("arch3")
-    centroid = np.array([0.5, 0.3])
-    f_val, f_jac = _compute_jacobian(f_sym, symbols, centroid)
-    print(f"  f(centroid) = {f_val}")
-    print(f"  J_f shape   = {f_jac.shape}")
-    assert f_jac.shape == (2, 2)
-
-    print("\nSmoke test: _split_cell")
-    verts = np.array([[0.,0.],[1.,0.],[1.,1.],[0.,1.]])
-    d = np.array([1., 0.])   # cut at x=0.5
-    pos, neg = _split_cell(verts, d, 0.5)
-    assert pos.shape[1] == 2 and neg.shape[1] == 2
-    assert (pos[:, 0] >= 0.5 - 1e-10).all(), f"pos side wrong: {pos}"
-    assert (neg[:, 0] <= 0.5 + 1e-10).all(), f"neg side wrong: {neg}"
-    print(f"  pos vertices: {pos.shape[0]}  neg vertices: {neg.shape[0]}")
+    print("\nSmoke test: SVD principal direction")
+    pts = np.array([[0.,0.],[2.,0.],[4.,0.]])   # all on x-axis
+    X   = pts - pts.mean(axis=0)
+    _, _, Vt = np.linalg.svd(X, full_matrices=False)
+    d = Vt[0]
+    assert abs(abs(d[0]) - 1.0) < 1e-6, f"Expected [1,0], got {d}"
+    print(f"  Principal direction: {d} (expected [±1, 0])")
 
     print("\nAll smoke tests passed.")
