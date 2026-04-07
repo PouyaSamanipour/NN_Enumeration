@@ -498,7 +498,6 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
         with torch.no_grad():
             p = param.cpu().numpy() if device.type == "cuda" else param.numpy()
             params.append(p)
-
     # The model has one (weight, bias) pair per hidden layer plus one output layer.
     # Total parameter tensors = 2 * (num_hidden_layers + 1).
     # Rearranged: num_hidden_layers = (total_tensors - 4) / 2 + 1
@@ -726,6 +725,23 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
             BC, sv, hyperplanes, b, W,bdh,bdb,
             barrier_model, dynamics_name=dynamics_name
     )
+        from relu_region_enumerator.validate_with_nlp import validate_with_nlp
+
+        report = validate_with_nlp(
+            BC, sv, hyperplanes, b, W,bdh,bdb,
+            barrier_model, dynamics_name=dynamics_name,
+            summary=summary,        # pass the VerificationSummary from verify_barrier
+            continuous_time=True,
+        )
+        report.print_counterexamples(
+    max_print    = 5,
+    BC           = BC,
+    sv           = sv,
+    layer_W      = hyperplanes,
+    W_out        = W,
+    barrier_model= barrier_model,
+)
+        # report.print_counterexamples()
     if verification == "lyapunov":
         # D_raw = Finding_cell_id(enumerate_poly, hyperplanes, b, num_hidden_layers)
         sv_all = np.hstack([D_raw[l] for l in range(num_hidden_layers)]).T
