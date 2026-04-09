@@ -246,7 +246,7 @@ class NLPReport:
                 diff           = abs(B_centroid - B_aff_centroid)
 
                 # ── validity flags ────────────────────────────────────────────
-                zls_ok  = abs(B_xopt) <= 1e-3
+                zls_ok  = abs(B_xopt) <= 1e-5
                 pi_ok   = diff <= 1e-4
                 valid   = zls_ok and pi_ok and r.success
 
@@ -292,8 +292,8 @@ def _solve_cell_nlp(
     model_dtype,
     n_starts        : int   = 8,
     tol             : float = 1e-10,
-    zls_tol         : float = 1e-3,   # max |B_net(x*)| to accept a result
-    ineq_tol        : float = 1e-3,   # max polytope constraint violation to accept
+    zls_tol         : float = 1e-5,   # max |B_net(x*)| to accept a result
+    ineq_tol        : float = 1e-5,   # max polytope constraint violation to accept
 ) -> tuple:
     """
     Solve: maximize p_i . f(x)  s.t.  p_i @ x + c_i = 0,  x in X_i
@@ -326,29 +326,48 @@ def _solve_cell_nlp(
     signs = np.sign(centroid_vals)
     signs[signs == 0] = -1.0
 
-    A_ub = (signs[:, None] * H_all)
-    b_ub = -(signs * b_all)
+    A_ub = -(signs[:, None] * H_all)
+    b_ub = (signs * b_all)
 
-    # ── Affine ZLS projection ─────────────────────────────────────────────────
+    # ── Affine ZLS projection (fallback only) ────────────────────────────────
     p_norm_sq = float(p_i @ p_i)
 
     def _proj(x):
         return x - (float(p_i @ x) + c_i) / p_norm_sq * p_i
 
-    # ── Starting points: vertices sorted by |B_net(v)| ───────────────────────
+    # ── Starting points: edge-interpolated ZLS crossings ─────────────────────
+    # Interpolate along every cell edge that straddles B(x)=0.
+    # These points are exactly on the affine ZLS and inside the cell by
+    # construction — far better than projecting vertices which can land outside.
     with torch.no_grad():
-        B_verts = np.array([
-            float(barrier_model(
-                torch.tensor(v.astype(np.float32)[None, :], dtype=model_dtype)
-            ).detach().numpy().ravel()[0])
-            for v in vertices
-        ])
-    order     = np.argsort(np.abs(B_verts))      # closest to ZLS first
-    top_verts = vertices[order[:n_starts]]
+        B_verts = barrier_model(
+            torch.tensor(vertices.astype(np.float32), dtype=model_dtype)
+        ).detach().numpy().ravel().astype(np.float64)
 
-    starting_points = [_proj(centroid)]
-    for v in top_verts:
-        starting_points.append(_proj(v))
+    x_stars_list = []
+    nv = len(vertices)
+    for u in range(nv):
+        for v in range(u + 1, nv):
+            bu, bv = B_verts[u], B_verts[v]
+            if bu * bv < 0:   # edge straddles ZLS
+                t = -bu / (bv - bu)
+                x_stars_list.append(vertices[u] + t * (vertices[v] - vertices[u]))
+
+    if len(x_stars_list) > 0:
+        x_stars_arr = np.array(x_stars_list)
+        if len(x_stars_arr) > n_starts:
+            # Pick most spread-out subset
+            zls_c = x_stars_arr.mean(axis=0)
+            dists = np.linalg.norm(x_stars_arr - zls_c, axis=1)
+            idx   = np.argsort(dists)[-n_starts:]
+            starting_points = list(x_stars_arr[idx])
+        else:
+            starting_points = list(x_stars_arr)
+        # Add centroid projection as fallback
+        starting_points.append(_proj(centroid))
+    else:
+        # No crossings found via edges — fall back to projected centroid
+        starting_points = [_proj(centroid)]
 
     # ── Objective ─────────────────────────────────────────────────────────────
     def objective(x):
@@ -515,6 +534,46 @@ def validate_with_nlp(
             dyn, continuous_time, barrier_model, model_dtype,
             n_starts=n_starts,
         )
+
+        # ── Post-solve diagnostic ─────────────────────────────────────────────
+        # Check x_opt is (1) on the ZLS, (2) inside the cell, (3) objective
+        # is self-consistent.  Warn if either feasibility check fails so we
+        # can catch constraint bugs early without silently accepting bad results.
+        with torch.no_grad():
+            B_xopt_check = float(barrier_model(
+                torch.tensor(x_opt.astype(np.float32)[None, :], dtype=model_dtype)
+            ).detach().numpy().ravel()[0])
+        f_xopt_check, _ = dyn.eval(x_opt)
+        lie_check        = float(p_i @ f_xopt_check) if continuous_time else None
+
+        H_diag, b_diag  = get_cell_hyperplanes_input_space(
+            sv_i, layer_W, layer_b, boundary_H, boundary_b
+        )
+        centroid_diag   = vertices.mean(axis=0)
+        cell_vals_diag  = H_diag @ x_opt + b_diag
+        centroid_vals_d = H_diag @ centroid_diag + b_diag
+        slack_tol       = 1e-5
+        n_viol          = int(
+            (cell_vals_diag * np.sign(centroid_vals_d) < -slack_tol).sum()
+        )
+        zls_diag_ok  = abs(B_xopt_check) <= 1e-5
+        cell_diag_ok = n_viol == 0
+
+        if not zls_diag_ok or not cell_diag_ok:
+            import warnings
+            warnings.warn(
+                f"[validate_with_nlp cell {i}] "
+                f"B(x*)={B_xopt_check:+.6f} (zls_ok={zls_diag_ok})  "
+                f"p_i·f(x*)={lie_check:+.6f}  "
+                f"cell_violated={n_viol}/{len(cell_vals_diag)}  "
+                f"opt_val={opt_val:+.6f}  success={success}  "
+                f"=> result may be UNRELIABLE"
+            )
+            # Downgrade UNSAFE result if x_opt is not feasible
+            if opt_val > unsafe_tol:
+                opt_val = -np.inf
+                success = False
+        # ─────────────────────────────────────────────────────────────────────
 
         nlp_label  = "UNSAFE" if opt_val > unsafe_tol else "SAFE"
         our_label  = our_labels.get(i, "UNKNOWN")

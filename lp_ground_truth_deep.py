@@ -29,6 +29,7 @@ Usage
 
 import argparse
 import itertools
+from random import seed
 import time
 
 import numpy as np
@@ -302,12 +303,12 @@ def run_trial(n, m1, m2, seed, domain, slack):
     print(f"\n  Seed {seed}: n={n}, m1={m1}, m2={m2}, "
           f"domain=[-{domain},{domain}]^{n}, "
           f"total patterns=2^{m1+m2}={2**(m1+m2)}")
-
+ 
     H1, b1, H2, b2 = random_deep_network(n, m1, m2, seed)
     TH = [domain] * n
     G  = np.vstack((np.eye(n), -np.eye(n)))
     g  = np.array(TH + TH, dtype=np.float64)
-
+ 
     # --- LP ground truth ---
     print(f"    Running LP feasibility on {2**(m1+m2)} joint patterns...",
           end=" ", flush=True)
@@ -315,29 +316,28 @@ def run_trial(n, m1, m2, seed, domain, slack):
         H1, b1, H2, b2, G, g, slack=slack
     )
     print(f"{n_lp} feasible  ({t_lp:.2f} s)")
-
+ 
     # --- Enumerator ---
     print(f"    Running deep enumerator...", end=" ", flush=True)
     cells, n_enum, t_enum = run_enumerator_deep(H1, b1, H2, b2, TH)
     print(f"{n_enum} cells  ({t_enum:.3f} s)")
-
+ 
     # --- Count comparison ---
     count_match = n_enum == n_lp
-
+ 
     # --- Sign vector comparison ---
     lp_sv_set   = set(feasible_patterns)
     enum_sv_set = get_sign_vectors_deep(cells, H1, b1, H2, b2)
-
+ 
     missing_from_enum = lp_sv_set   - enum_sv_set
     extra_in_enum     = enum_sv_set - lp_sv_set
-
     sv_match = (len(missing_from_enum) == 0 and len(extra_in_enum) == 0)
-
+ 
     print(f"    (a) Count match        : {'PASS' if count_match else 'FAIL'}  "
           f"(LP={n_lp}, Enum={n_enum})")
     print(f"    (b) Sign vector match  : {'PASS' if sv_match else 'FAIL'}  "
           f"(missing={len(missing_from_enum)}, extra={len(extra_in_enum)})")
-
+ 
     if not sv_match:
         if missing_from_enum:
             print(f"    Patterns in LP but not enum ({len(missing_from_enum)}):")
@@ -347,10 +347,28 @@ def run_trial(n, m1, m2, seed, domain, slack):
             print(f"    Patterns in enum but not LP ({len(extra_in_enum)}):")
             for p in list(extra_in_enum)[:3]:
                 print(f"      s1={p[0]}, s2={p[1]}")
-
+ 
+    # # --- CDD vertex validation ---
+    # from cdd_vertex_validation import run_cdd_vertex_validation
+    # print(f"    Running cddlib vertex validation on {n_enum} cells...")
+    # cdd_report = run_cdd_vertex_validation(
+    #     cells, H1, b1, H2, b2, TH,
+    #     n_check=None,
+    #     tol=1e-5,
+    #     print_every=max(1, n_enum // 5),
+    # )
+    # cdd_pass = (cdd_report.n_hrep_fail    == 0 and
+    #             cdd_report.n_roundtrip_fail == 0 and
+    #             cdd_report.n_missing_total  == 0 and
+    #             cdd_report.n_redundant_total == 0)
+    # print(f"    (c) CDD vertex match   : {'PASS' if cdd_pass else 'FAIL'}  "
+    #       f"(hrep_fail={cdd_report.n_hrep_fail}, "
+    #       f"missing={cdd_report.n_missing_total}, "
+    #       f"redundant={cdd_report.n_redundant_total})")
+ 
     overall = count_match and sv_match
     print(f"    OVERALL: {'PASS' if overall else 'FAIL'}")
-
+ 
     return {
         "seed"              : seed,
         "n_lp"              : n_lp,
@@ -363,8 +381,7 @@ def run_trial(n, m1, m2, seed, domain, slack):
         "extra_in_enum"     : len(extra_in_enum),
         "pass"              : overall,
     }
-
-
+ 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -398,12 +415,12 @@ def main():
         r    = run_trial(args.n, args.m1, args.m2, seed, args.domain, args.slack)
         results.append(r)
 
-    print("\n" + "=" * 60)
+    print(f"\n{'='*75}")
     print("SUMMARY")
-    print("=" * 60)
+    print(f"{'='*75}")
     print(f"  {'Seed':>6}  {'LP':>6}  {'Enum':>6}  {'t_LP':>8}  "
           f"{'t_Enum':>8}  {'Count':>6}  {'SigVec':>6}  {'Result':>6}")
-    print("  " + "-" * 60)
+    print("  " + "-" * 70)
     for r in results:
         print(f"  {r['seed']:>6}  {r['n_lp']:>6}  {r['n_enum']:>6}  "
               f"{r['t_lp']:>8.2f}s  {r['t_enum']:>8.3f}s  "
@@ -413,8 +430,7 @@ def main():
 
     n_pass = sum(r["pass"] for r in results)
     print(f"\n  Passed: {n_pass} / {args.trials}")
-    print("=" * 60)
-
+    print(f"{'='*75}")
 
 if __name__ == "__main__":
     main()

@@ -65,6 +65,7 @@ import torch
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Tuple, Optional
+from .bitwise_utils import finding_deep_hype
 
 try:
     from .hessian_bound import HessianBounder, compute_local_gradient
@@ -236,14 +237,16 @@ class DynamicsEvaluator:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _get_zero_level_set_crossings(
-    vertices   : np.ndarray,   # (V, n)
-    sv_i       : np.ndarray,   # (total_neurons,)
-    B_vals     : np.ndarray,   # (V,) B at vertices — exact since B affine
-    layer_W    : list,
-    layer_b    : list,
-    boundary_H : np.ndarray,   # (B, n) — may include fake neurons / ZLS
-    boundary_b : np.ndarray,   # (B,)
-    use_wide   : bool,
+    vertices      : np.ndarray,   # (V, n)
+    sv_i          : np.ndarray,   # (total_neurons,)
+    B_vals        : np.ndarray,   # (V,) B at vertices — exact since B affine
+    layer_W       : list,
+    layer_b       : list,
+    boundary_H    : np.ndarray,   # (B, n) — may include fake neurons / ZLS
+    boundary_b    : np.ndarray,   # (B,)
+    use_wide      : bool,
+    barrier_model = None,         # optional — for ZLS residual sanity check
+    model_dtype   = None,
 ) -> Tuple[np.ndarray, np.ndarray]:   # (created_verts, created_masks)
     """
     Find exact zero level set crossings using bitmask slicing.
@@ -253,6 +256,14 @@ def _get_zero_level_set_crossings(
     slice_polytope_with_hyperplane uses bitmask adjacency to find only
     valid polytope edges — created_verts are the exact crossing points.
 
+    ZLS sanity check (when barrier_model is provided)
+    --------------------------------------------------
+    Every crossing point x* must satisfy B(x*) = 0 to floating-point
+    precision.  Large residuals indicate that two vertices from different
+    activation regions were incorrectly treated as adjacent (bitmask error).
+    Crossings with |B(x*)| > zls_residual_tol are filtered out and a
+    warning is printed so the caller can investigate.
+
     Returns
     -------
     created_verts : (E, n)          zero level set crossing points
@@ -260,13 +271,15 @@ def _get_zero_level_set_crossings(
                     bitmasks of the crossing points — needed for subsequent
                     refinement slicing along the fake neuron hyperplane
     """
-    n = vertices.shape[1]
+    import warnings
 
-    empty_masks = np.zeros(0, dtype=np.uint64)
+    n               = vertices.shape[1]
+    zls_residual_tol = 1e-3
+    empty_masks     = np.zeros(0, dtype=np.uint64)
 
     if B_vals.min() >= -1e-9 or B_vals.max() <= 1e-9:
         return np.zeros((0, n)), empty_masks
-
+    
     H_all, b_all = get_cell_hyperplanes_input_space(
         sv_i, layer_W, layer_b, boundary_H, boundary_b
     )
@@ -292,12 +305,48 @@ def _get_zero_level_set_crossings(
     if len(created_verts) == 0:
         return np.zeros((0, n)), empty_masks
 
+    created_verts = np.array(created_verts)
+
     # created_verts are appended at the end of both child mask arrays.
     # Extract their masks from mask_lists[0] (inside child).
     n_orig_in     = len(polytopes[0]) - len(created_verts)
-    created_masks = mask_lists[0][n_orig_in:]   # last E entries
+    created_masks = np.array(mask_lists[0][n_orig_in:])   # last E entries
 
-    return np.array(created_verts), np.array(created_masks)
+    # ── ZLS sanity check ──────────────────────────────────────────────────────
+    # Each crossing point x* is computed by linear interpolation on a polytope
+    # edge.  Since B is affine within the cell, B(x*) = 0 exactly in exact
+    # arithmetic.  A large residual means the bitmask adjacency used a
+    # spurious edge connecting two vertices from different activation regions.
+    # We filter those crossings out and warn so the issue can be investigated.
+    if barrier_model is not None and model_dtype is not None:
+        np_dtype = np.float64 if model_dtype == torch.float64 else np.float32
+        with torch.no_grad():
+            B_cross = barrier_model(
+                torch.tensor(created_verts.astype(np_dtype), dtype=model_dtype)
+            ).detach().numpy().ravel().astype(np.float64)
+
+        residuals    = np.abs(B_cross)
+        max_residual = float(residuals.max())
+
+        if max_residual > zls_residual_tol:
+            n_spurious = int((residuals > zls_residual_tol).sum())
+            warnings.warn(
+                f"_get_zero_level_set_crossings: {n_spurious}/{len(created_verts)} "
+                f"crossing point(s) have |B(x*)| > {zls_residual_tol:.0e} "
+                f"(max residual = {max_residual:.2e}). "
+                f"Filtering spurious crossings. This may indicate a bitmask "
+                f"adjacency error — two vertices from different activation "
+                f"regions treated as adjacent."
+            )
+
+        valid         = residuals <= zls_residual_tol
+        created_verts = created_verts[valid]
+        created_masks = created_masks[valid]
+
+        if len(created_verts) == 0:
+            return np.zeros((0, n)), empty_masks
+
+    return created_verts, created_masks
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -324,6 +373,7 @@ def _two_step_label(
         Returns label, M_i, r_i, remainder, counterex.
     """
     model_dtype = next(barrier_model.parameters()).dtype
+    np_dtype    = np.float64 if model_dtype == torch.float64 else np.float32
 
     c_star   = x_stars.mean(axis=0)
     eval_pts = np.vstack([x_stars, c_star[None, :]])   # (E+1, n)
@@ -334,7 +384,7 @@ def _two_step_label(
     else:
         with torch.no_grad():
             exact_vals = barrier_model(
-                torch.tensor(f_exact.astype(np.float32), dtype=model_dtype)
+                torch.tensor(f_exact.astype(np_dtype), dtype=model_dtype)
             ).numpy().ravel()
 
     # Step 1: exact check
@@ -342,7 +392,7 @@ def _two_step_label(
         if exact_vals[e] > 0.0:
             with torch.no_grad():
                 B_x = float(barrier_model(
-                    torch.tensor(eval_pts[e:e+1].astype(np.float32),
+                    torch.tensor(eval_pts[e:e+1].astype(np_dtype),
                                  dtype=model_dtype)
                 ).numpy().ravel()[0])
             ce = Counterexample(
@@ -715,6 +765,7 @@ def _label_lyapunov_cell(
 
 def _nlp_fallback(
     vertices        : np.ndarray,
+    x_stars         : np.ndarray,   # (E, n) ZLS crossing points — used as starting points
     sv_i            : np.ndarray,
     p_i             : np.ndarray,
     c_i             : float,
@@ -735,68 +786,134 @@ def _nlp_fallback(
 
     Solves: maximize p_i . f(x)  s.t.  p_i @ x + c_i = 0,  x in X_i
 
+    The feasible region is the ZLS face: the hyperplane B(x)=0 intersected
+    with the cell polytope.  Cell halfspaces are encoded directly from sv_i:
+        sv_i[h] > 0  =>  H[h] @ x + b[h] >= 0
+        sv_i[h] == 0 =>  H[h] @ x + b[h] <= 0
+    which gives signs[h] * (H[h] @ x + b[h]) >= 0 for all h.
+
+    Starting points are the ZLS crossing points x_stars (already on the ZLS),
+    which explore the actual feasible face rather than projected cell vertices.
+
     Returns:
-      SAFE_NLP     if NLP finds no violation (opt_val <= unsafe_tol)
-      UNSAFE       if NLP finds a violation (opt_val > unsafe_tol)
-      INCONCLUSIVE if NLP fails to converge
+      SAFE_NLP  if NLP finds no violation (best opt_val <= unsafe_tol)
+      UNSAFE    if NLP finds a violation (best opt_val >  unsafe_tol)
     """
     from scipy.optimize import minimize
 
-    n        = vertices.shape[1]
-    centroid = vertices.mean(axis=0)
+    n = vertices.shape[1]
 
-    # Cell halfspaces from activation pattern
+    # ── Cell halfspaces — signs read directly from sv_i ──────────────────────
     H_all, b_all = get_cell_hyperplanes_input_space(
         sv_i, layer_W, layer_b, boundary_H, boundary_b
     )
-    centroid_vals = H_all @ centroid + b_all
-    signs         = np.sign(centroid_vals)
-    signs[signs == 0] = -1.0
-    A_ub = signs[:, None] * H_all
-    b_ub = -(signs * b_all)
+    n_network      = sum(W.shape[0] for W in layer_W)
+    sv_signs       = np.where(sv_i > 0, 1.0, -1.0)          # (n_network,)
+    boundary_signs = np.ones(len(boundary_b))                 # domain always satisfied as >= 0
+    signs          = np.concatenate([sv_signs, boundary_signs])  # (n_network + B,)
+
+    # signs[h] * (H[h] @ x + b[h]) >= 0  <=>  A_ub @ x - b_ub >= 0
+    A_ub = signs[:, None] * H_all    # (H, n)
+    b_ub = -(signs * b_all)          # (H,)
 
     p_norm_sq = float(p_i @ p_i)
     if p_norm_sq < 1e-12:
         return Label.SAFE_NLP, None
 
+    # ── Objective: maximize p_i . f(x)  =>  minimize -(p_i . f(x)) ──────────
     def objective(x):
         f_val, _ = dyn.eval(x)
-        return -float(p_i @ f_val) if continuous_time else -float(
-            barrier_model(torch.tensor(f_val.astype(np.float32)[None, :],
-                         dtype=model_dtype)).detach().numpy().ravel()[0])
+        if continuous_time:
+            return -float(p_i @ f_val)
+        else:
+            with torch.no_grad():
+                return -float(barrier_model(
+                    torch.tensor(f_val.astype(np.float32)[None, :],
+                                 dtype=model_dtype)
+                ).detach().numpy().ravel()[0])
 
     def obj_grad(x):
         _, f_jac = dyn.eval(x)
         return -(f_jac.T @ p_i) if continuous_time else np.zeros(n)
 
+    # ── Constraints ───────────────────────────────────────────────────────────
+    # Equality:   p_i @ x + c_i = 0          (x on ZLS)
+    # Inequality: A_ub @ x - b_ub >= 0       (x inside cell)
     constraints = [
-        {'type': 'eq',   'fun': lambda x: float(p_i @ x) + c_i, 'jac': lambda x: p_i},
-        {'type': 'ineq', 'fun': lambda x: b_ub - A_ub @ x,       'jac': lambda x: -A_ub},
+        {'type': 'eq',
+         'fun': lambda x: float(p_i @ x) + c_i,
+         'jac': lambda x: p_i},
+        {'type': 'ineq',
+         'fun': lambda x: A_ub @ x - b_ub,
+         'jac': lambda x: A_ub},
     ]
 
-    # Starting points: vertices projected onto ZLS + centroid projected
-    x_proj = centroid - (float(p_i @ centroid) + c_i) / p_norm_sq * p_i
-    starts  = [x_proj] + [
-        v - (float(p_i @ v) + c_i) / p_norm_sq * p_i
-        for v in vertices[:n_starts]
-    ]
+    # ── Starting points: x_stars are already on the ZLS ──────────────────────
+    # Use up to n_starts of them, spread across the ZLS face.
+    # Add centroid-projected fallback in case x_stars are clustered.
+    centroid = vertices.mean(axis=0)
+    x_proj   = centroid - (float(p_i @ centroid) + c_i) / p_norm_sq * p_i
 
+    if len(x_stars) > n_starts:
+        # Pick most spread-out subset by distance from ZLS centroid
+        zls_centroid = x_stars.mean(axis=0)
+        dists        = np.linalg.norm(x_stars - zls_centroid, axis=1)
+        idx          = np.argsort(dists)[-n_starts:]
+        starts       = list(x_stars[idx]) + [x_proj]
+    else:
+        starts = list(x_stars) + [x_proj]
+
+    # ── Multi-start SLSQP ─────────────────────────────────────────────────────
     best_val = -np.inf
     best_x   = x_proj.copy()
 
     for x0 in starts:
         try:
-            res = minimize(objective, x0, jac=obj_grad, method='SLSQP',
-                           constraints=constraints,
-                           options={'ftol': 1e-9, 'maxiter': 500, 'disp': False})
-            val = -res.fun
+            res = minimize(
+                objective, x0, jac=obj_grad, method='SLSQP',
+                constraints=constraints,
+                options={'ftol': 1e-9, 'maxiter': 500, 'disp': False},
+            )
+            val = -res.fun   # maximize p_i . f(x)
             if val > best_val:
                 best_val = val
                 best_x   = res.x.copy()
         except Exception:
             pass
 
+    # ── Post-solve diagnostic ─────────────────────────────────────────────────
+    # Checks three things on the best point found:
+    #   1. B(x*) ≈ 0         — x* is actually on the ZLS
+    #   2. cell_violated == 0 — x* is inside the cell polytope
+    #   3. p_i·f(x*) == best_val — objective is self-consistent
+    with torch.no_grad():
+        B_best = float(barrier_model(
+            torch.tensor(best_x.astype(np.float32)[None, :], dtype=model_dtype)
+        ).detach().numpy().ravel()[0])
+    f_best, _    = dyn.eval(best_x)
+    lie_best     = float(p_i @ f_best) if continuous_time else None
+    cell_vals    = H_all @ best_x + b_all
+    centroid_ref = vertices.mean(axis=0)
+    centroid_cv  = H_all @ centroid_ref + b_all
+    n_violated   = int((cell_vals * np.sign(centroid_cv) < -1e-5).sum())
+    zls_ok       = abs(B_best) <= 1e-5
+    cell_ok      = n_violated == 0
+    if not zls_ok or not cell_ok:
+        import warnings
+        warnings.warn(
+            f"[NLP diag cell {cell_idx}] "
+            f"B(x*)={B_best:+.6f} (zls_ok={zls_ok})  "
+            f"p_i·f(x*)={lie_best:+.6f}  "
+            f"cell_violated={n_violated}/{len(cell_vals)}  "
+            f"best_val={best_val:+.6f}  "
+            f"=> result may be UNRELIABLE"
+        )
+    # ─────────────────────────────────────────────────────────────────────────
+
     if best_val > unsafe_tol:
+        # Only report UNSAFE if x* passes both feasibility checks
+        if not zls_ok or not cell_ok:
+            return Label.INCONCLUSIVE, None
         f_val, _ = dyn.eval(best_x)
         with torch.no_grad():
             B_x = float(barrier_model(
@@ -813,6 +930,288 @@ def _nlp_fallback(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Refinement visualisation (diagnostic — does not affect verification)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _pca_var(X_centered: np.ndarray, Vt: np.ndarray, k: int) -> float:
+    """Fraction of variance explained by PCA component k."""
+    total = float(np.sum(X_centered ** 2))
+    if total < 1e-30:
+        return 0.0
+    return float(np.sum((X_centered @ Vt[k]) ** 2)) / total
+
+
+def visualize_cell_refinement(
+    cell_idx        : int,
+    BC              : list,
+    sv              : np.ndarray,
+    layer_W         : list,
+    layer_b         : list,
+    W_out           : np.ndarray,
+    boundary_H      : np.ndarray,
+    boundary_b      : np.ndarray,
+    barrier_model,
+    dynamics_name   : str,
+    continuous_time : bool  = True,
+    n_refs_override : int   = None,
+    save_path       : str   = None,
+    ax              = None,
+) -> None:
+    """
+    Diagnostic visualisation for a single boundary cell.
+
+    Shows (2-D inputs only):
+      - The cell polytope
+      - The ZLS crossing points  (B(x) = 0 on cell edges)
+      - The ZLS segment connecting them
+      - The refinement hyperplanes that would be inserted if the cell
+        were INCONCLUSIVE:  n_refs-1 parallel cuts along the direction
+        of the farthest pair of ZLS crossing points
+
+    Parameters
+    ----------
+    cell_idx        : index into BC / sv
+    BC              : list of vertex arrays (one per boundary cell)
+    sv              : (N_cells, total_neurons) activation-pattern matrix
+    layer_W / layer_b : hidden-layer weights and biases
+    W_out           : output layer weight  (1, last_hidden)
+    boundary_H/b    : domain boundary hyperplanes
+    barrier_model   : TorchScript barrier certificate model
+    dynamics_name   : e.g. "arch3"
+    continuous_time : True for  p_i · f(x),  False for  B(f(x))
+    n_refs_override : fix the number of slabs (useful for illustration);
+                      if None, computed from  ceil(remainder / |worst_cond|)
+    save_path       : if given, save figure to this path instead of showing
+    ax              : existing matplotlib Axes to draw into; if None a new
+                      figure is created
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from scipy.spatial import ConvexHull
+
+    # ── setup ────────────────────────────────────────────────────────────────
+    symbols, f_sym = load_dynamics(dynamics_name)
+    hb      = HessianBounder(symbols, f_sym)
+    dyn     = DynamicsEvaluator(symbols, f_sym)
+    total_neurons = sum(W.shape[0] for W in layer_W)
+    use_wide      = (total_neurons + len(boundary_H) > 64)
+    model_dtype   = next(barrier_model.parameters()).dtype
+    np_dtype      = np.float64 if model_dtype == torch.float64 else np.float32
+
+    verts = np.asarray(BC[cell_idx], dtype=float)
+    sv_i  = sv[cell_idx].ravel()
+    p_i   = compute_local_gradient(sv_i, layer_W, W_out)
+    n     = verts.shape[1]
+    use_pca = (n > 2)
+
+    # ── ZLS crossings ────────────────────────────────────────────────────────
+    with torch.no_grad():
+        B_vals = barrier_model(
+            torch.tensor(verts.astype(np_dtype), dtype=model_dtype)
+        ).numpy().ravel()
+
+    x_stars, x_masks = _get_zero_level_set_crossings(
+        verts, sv_i, B_vals,
+        layer_W, layer_b, boundary_H, boundary_b, use_wide,
+        barrier_model=barrier_model, model_dtype=model_dtype,
+    )
+
+    if len(x_stars) < 2:
+        print(f"Cell {cell_idx}: fewer than 2 ZLS crossings — nothing to refine.")
+        return
+
+    # ── two-step label ───────────────────────────────────────────────────────
+    label, M_i, r_i, remainder, ce = _two_step_label(
+        x_stars, barrier_model, dyn, hb, p_i, cell_idx, continuous_time
+    )
+
+    # ── compute worst_cond directly (not returned by _two_step_label) ────────
+    c_star   = x_stars.mean(axis=0)
+    f_c, f_j = dyn.eval(c_star)
+    delta    = x_stars - c_star
+    f_lin    = f_c + delta @ f_j.T
+    if continuous_time:
+        cond_vals = f_lin @ p_i
+    else:
+        with torch.no_grad():
+            cond_vals = barrier_model(
+                torch.tensor(f_lin.astype(np_dtype), dtype=model_dtype)
+            ).numpy().ravel()
+    worst_cond = float(cond_vals.max())
+
+    # ── n_refs ───────────────────────────────────────────────────────────────
+    abs_f_lin   = max(abs(worst_cond), 1e-10)
+    n_refs_real = max(2, int(np.ceil(remainder / abs_f_lin)))
+    n_refs_real = min(n_refs_real, 32)
+    n_refs      = n_refs_override if n_refs_override is not None else n_refs_real
+
+    print(f"\nCell {cell_idx}  label={label.value}")
+    print(f"  ZLS crossings : {len(x_stars)}")
+    print(f"  M_i           : {M_i:.4e}")
+    print(f"  r_i           : {r_i:.4e}")
+    print(f"  remainder     : {remainder:.4e}")
+    print(f"  worst_cond    : {worst_cond:.4e}")
+    print(f"  n_refs (real) : {n_refs_real}")
+    print(f"  n_refs (draw) : {n_refs}")
+
+    # ── farthest pair → normal direction ────────────────────────────────────
+    E     = len(x_stars)
+    dmat  = np.linalg.norm(x_stars[:, None] - x_stars[None, :], axis=2)
+    flat  = int(np.argmax(dmat))
+    ia, ib = divmod(flat, E)
+    normal = (x_stars[ib] - x_stars[ia]) / float(dmat[ia, ib])
+
+    # cut offsets spaced evenly between the two farthest crossing points
+    base = float(x_stars[ia] @ normal)
+    step = float((x_stars[ib] - x_stars[ia]) @ normal) / n_refs
+    cuts = [base + k * step for k in range(1, n_refs)]
+
+    # ── label colours ────────────────────────────────────────────────────────
+    COLORS = {
+        Label.SAFE_TAYLOR  : "#2ecc71",
+        Label.SAFE_NLP     : "#27ae60",
+        Label.UNSAFE       : "#e74c3c",
+        Label.INCONCLUSIVE : "#f39c12",
+    }
+
+    # ── PCA projection for n > 2 ─────────────────────────────────────────────
+    if use_pca:
+        # Fit PCA on the ZLS crossing points — they define the relevant subspace.
+        mu     = x_stars.mean(axis=0)
+        X_c    = x_stars - mu
+        _, _, Vt = np.linalg.svd(X_c, full_matrices=False)
+        V2     = Vt[:2]          # (2, n) — first two principal directions
+
+        # Project everything onto the 2D PCA plane
+        xs2    = (x_stars - mu) @ V2.T          # (E, 2)
+        verts2 = (verts   - mu) @ V2.T          # (V, 2)
+
+        # Project normal and cuts into the 2D PCA plane
+        # Original cut: normal @ x = cut_off
+        # In PCA coords z:  x ≈ mu + V2.T @ z
+        # → (V2 @ normal) @ z = cut_off - normal @ mu
+        normal2      = V2 @ normal               # (2,) projected normal
+        mu_offset    = float(normal @ mu)
+        cuts2_offset = [c - mu_offset for c in cuts]
+
+        # Use projected quantities for all drawing below
+        verts_plot  = verts2
+        xs_plot     = xs2
+        normal_plot = normal2
+        cuts_plot   = cuts2_offset
+        xlabel = f"PC1  (var={_pca_var(X_c, Vt, 0):.1%})"
+        ylabel = f"PC2  (var={_pca_var(X_c, Vt, 1):.1%})"
+    else:
+        verts_plot  = verts
+        xs_plot     = x_stars
+        normal_plot = normal
+        cuts_plot   = cuts
+        xlabel, ylabel = "$x_1$", "$x_2$"
+
+    # ── plotting ─────────────────────────────────────────────────────────────
+    own_fig = ax is None
+    if own_fig:
+        fig, ax = plt.subplots(figsize=(6, 6))
+
+    # bounding box with margin
+    margin = max(0.05 * (verts_plot.max(axis=0) - verts_plot.min(axis=0)).max(), 0.02)
+    xlo, xhi = verts_plot[:, 0].min() - margin, verts_plot[:, 0].max() + margin
+    ylo, yhi = verts_plot[:, 1].min() - margin, verts_plot[:, 1].max() + margin
+    ax.set_xlim(xlo, xhi)
+    ax.set_ylim(ylo, yhi)
+    ax.set_aspect("equal")
+
+    # cell polygon (projected)
+    try:
+        hull  = ConvexHull(verts_plot)
+        poly  = verts_plot[hull.vertices]
+    except Exception:
+        poly  = verts_plot
+    cell_patch = plt.Polygon(poly, closed=True,
+                             facecolor=COLORS.get(label, "#cccccc"),
+                             alpha=0.30, edgecolor="k", linewidth=1.4, zorder=1)
+    ax.add_patch(cell_patch)
+
+    # ZLS face — draw as convex hull polygon (correct for n>2) or segment (n=2)
+    ax.scatter(xs_plot[:, 0], xs_plot[:, 1],
+               c="navy", s=35, zorder=5, label="ZLS crossings")
+    if use_pca and len(xs_plot) >= 3:
+        # In n>2 the ZLS face is a convex polytope — show its 2D projection hull
+        try:
+            zls_hull = ConvexHull(xs_plot)
+            zls_poly = xs_plot[zls_hull.vertices]
+            zls_patch = plt.Polygon(zls_poly, closed=True,
+                                    facecolor="navy", alpha=0.20,
+                                    edgecolor="navy", linewidth=2.0, zorder=4)
+            ax.add_patch(zls_patch)
+        except Exception:
+            ax.plot(xs_plot[:, 0], xs_plot[:, 1], color="navy", lw=2.0, zorder=4)
+    else:
+        # 2D: ZLS is a line segment — connect in order along normal
+        order  = np.argsort(xs_plot @ normal_plot)
+        xs_ord = xs_plot[order]
+        ax.plot(xs_ord[:, 0], xs_ord[:, 1],
+                color="navy", lw=2.5, zorder=4, label="ZLS (B=0)")
+
+    # farthest-pair arrow (in projected coords)
+    ax.annotate("", xy=xs_plot[ib], xytext=xs_plot[ia],
+                arrowprops=dict(arrowstyle="<->", color="purple",
+                                lw=1.5, mutation_scale=14))
+
+    # refinement cut hyperplanes — line: normal_plot @ z = cut_off_2d
+    cmap = plt.cm.Reds
+    nx, ny = normal_plot
+    for k, cut_off in enumerate(cuts_plot):
+        pts = []
+        for x_fix in (xlo, xhi):
+            if abs(ny) > 1e-12:
+                y_val = (cut_off - nx * x_fix) / ny
+                if ylo - 1e-9 <= y_val <= yhi + 1e-9:
+                    pts.append((x_fix, y_val))
+        for y_fix in (ylo, yhi):
+            if abs(nx) > 1e-12:
+                x_val = (cut_off - ny * y_fix) / nx
+                if xlo - 1e-9 <= x_val <= xhi + 1e-9:
+                    pts.append((x_val, y_fix))
+        pts = list({(round(p[0], 12), round(p[1], 12)) for p in pts})
+        if len(pts) >= 2:
+            color = cmap(0.35 + 0.55 * k / max(len(cuts_plot) - 1, 1))
+            ax.plot([pts[0][0], pts[1][0]], [pts[0][1], pts[1][1]],
+                    color=color, lw=1.6, ls="--", zorder=3,
+                    label="Refinement cuts" if k == 0 else f"_cut{k+1}")
+
+    # title and labels
+    pca_note = f"  [PCA projection, n={n}D→2D]" if use_pca else ""
+    ax.set_title(
+        f"Cell {cell_idx}   [{label.value}]{pca_note}\n"
+        f"n_refs(real)={n_refs_real}   n_refs(draw)={n_refs}\n"
+        f"remainder={remainder:.2e}   |f_lin|={abs(worst_cond):.2e}",
+        fontsize=9,
+    )
+    ax.set_xlabel(xlabel, fontsize=8)
+    ax.set_ylabel(ylabel, fontsize=8)
+
+    handles = [
+        mpatches.Patch(color=COLORS.get(label, "#cccccc"),
+                       label=f"Cell [{label.value}]"),
+        plt.Line2D([0], [0], color="navy", lw=2.5, label="ZLS (B=0)"),
+        plt.Line2D([0], [0], color="navy", marker="o", lw=0,
+                   markersize=6, label="ZLS crossings"),
+        plt.Line2D([0], [0], color=cmap(0.6), lw=1.6, ls="--",
+                   label=f"Refinement cuts (×{len(cuts_plot)})"),
+    ]
+    ax.legend(handles=handles, fontsize=7, loc="best")
+
+    if own_fig:
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=150)
+            print(f"  Figure saved: {save_path}")
+        else:
+            plt.show()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Public API
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -825,12 +1224,13 @@ def verify_barrier(
     boundary_H      : np.ndarray,
     boundary_b      : np.ndarray,
     barrier_model,
-    dynamics_name   : str,
-    continuous_time : bool  = True,
-    early_exit      : bool  = True,
-    nlp_fallback    : bool  = True,
-    nlp_n_starts    : int   = 5,
-    nlp_unsafe_tol  : float = 1e-6,
+    dynamics_name          : str,
+    continuous_time        : bool       = True,
+    early_exit             : bool       = True,
+    nlp_fallback           : bool       = True,
+    nlp_n_starts           : int        = 5,
+    nlp_unsafe_tol         : float      = 1e-6,
+    visualize_inconclusive : bool | str = False,
 ) -> VerificationSummary:
     """
     Formally verify barrier certificate on all boundary-adjacent cells.
@@ -845,6 +1245,11 @@ def verify_barrier(
            Run NLP to find max p_i . f(x) on ZLS
            -> SAFE_NLP: no violation found (heuristic)
            -> UNSAFE: counterexample candidate found by NLP
+
+    visualize_inconclusive
+        False   — no visualisation (default)
+        True    — show an interactive plot for each INCONCLUSIVE cell
+        str     — save figures to "<str>_cell<i>.png" for each cell i
     """
     from scipy.optimize import minimize
 
@@ -869,9 +1274,10 @@ def verify_barrier(
         p_i      = compute_local_gradient(sv_i, layer_W, W_out)
 
         # B values at vertices — exact since B is affine on cell
+        np_dtype = np.float64 if model_dtype == torch.float64 else np.float32
         with torch.no_grad():
             B_vals = barrier_model(
-                torch.tensor(vertices.astype(np.float32), dtype=model_dtype)
+                torch.tensor(vertices.astype(np_dtype), dtype=model_dtype)
             ).numpy().ravel()
 
         # B offset: B(x) = p_i @ x + c_i
@@ -879,7 +1285,7 @@ def verify_barrier(
         with torch.no_grad():
             c_i = float(
                 barrier_model(
-                    torch.tensor(centroid.astype(np.float32)[None, :],
+                    torch.tensor(centroid.astype(np_dtype)[None, :],
                                  dtype=model_dtype)
                 ).detach().numpy().ravel()[0]
             ) - float(p_i @ centroid)
@@ -887,7 +1293,9 @@ def verify_barrier(
         # Find zero level set crossings
         x_stars, _ = _get_zero_level_set_crossings(
             vertices, sv_i, B_vals,
-            layer_W, layer_b, boundary_H, boundary_b, use_wide
+            layer_W, layer_b, boundary_H, boundary_b, use_wide,
+            barrier_model=barrier_model,
+            model_dtype=model_dtype,
         )
 
         if len(x_stars) == 0:
@@ -903,10 +1311,25 @@ def verify_barrier(
             x_stars, barrier_model, dyn, hb, p_i, i, continuous_time
         )
 
+        # Visualise refinement for INCONCLUSIVE cells (before NLP)
+        if label == Label.INCONCLUSIVE and visualize_inconclusive:
+            _viz_save = (
+                f"{visualize_inconclusive}_cell{i}.png"
+                if isinstance(visualize_inconclusive, str)
+                else None
+            )
+            visualize_cell_refinement(
+                i, BC, sv, layer_W, layer_b, W_out,
+                boundary_H, boundary_b, barrier_model,
+                dynamics_name=dynamics_name,
+                continuous_time=continuous_time,
+                save_path=_viz_save,
+            )
+
         # NLP fallback for INCONCLUSIVE cells — direct, no refinement
         if label == Label.INCONCLUSIVE and nlp_fallback:
             label, ce = _nlp_fallback(
-                vertices, sv_i, p_i, c_i,
+                vertices, x_stars, sv_i, p_i, c_i,
                 layer_W, layer_b, boundary_H, boundary_b,
                 dyn, barrier_model, model_dtype,
                 continuous_time, nlp_n_starts, nlp_unsafe_tol, i,
