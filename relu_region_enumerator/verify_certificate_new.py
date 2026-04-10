@@ -234,19 +234,30 @@ def _get_zero_level_set_crossings(
     use_wide      : bool,
     barrier_model = None,
     model_dtype   = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Find exact zero level set crossings using bitmask slicing.
-    Identical to verify_certificates.py.
+
+    Returns
+    -------
+    x_stars      : (K, n) crossing points with B(x*)≈0
+    x_masks      : (K,)   bitmasks for x_stars
+    verts_B_neg  : vertices of the B≤0 sub-polytope (x_stars included)
+    verts_B_pos  : vertices of the B≥0 sub-polytope (x_stars included)
+
+    verts_B_neg / verts_B_pos are the two halves produced by slicing the
+    cell at B=0; the caller can use these to construct a ZLS-facet sub-cell
+    for adaptive refinement without recomputing crossings.
     """
     import warnings
 
     n                = vertices.shape[1]
     zls_residual_tol = 1e-3
     empty_masks      = np.zeros(0, dtype=np.uint64)
+    empty_verts      = np.zeros((0, n), dtype=np.float64)
 
     if B_vals.min() >= -1e-9 or B_vals.max() <= 1e-9:
-        return np.zeros((0, n)), empty_masks
+        return empty_verts, empty_masks, empty_verts, empty_verts
 
     H_all, b_all = get_cell_hyperplanes_input_space(
         sv_i, layer_W, layer_b, boundary_H, boundary_b
@@ -271,9 +282,13 @@ def _get_zero_level_set_crossings(
         )
 
     if len(created_verts) == 0:
-        return np.zeros((0, n)), empty_masks
+        return empty_verts, empty_masks, empty_verts, empty_verts
 
     created_verts = np.array(created_verts)
+
+    # Keep the two sub-polytope vertex arrays before any filtering
+    verts_B_neg = np.asarray(polytopes[0], dtype=np.float64)  # B ≤ 0 side
+    verts_B_pos = np.asarray(polytopes[1], dtype=np.float64)  # B ≥ 0 side
 
     n_orig_in     = len(polytopes[0]) - len(created_verts)
     created_masks = np.array(mask_lists[0][n_orig_in:])
@@ -302,9 +317,9 @@ def _get_zero_level_set_crossings(
         created_masks = created_masks[valid]
 
         if len(created_verts) == 0:
-            return np.zeros((0, n)), empty_masks
+            return empty_verts, empty_masks, empty_verts, empty_verts
 
-    return created_verts, created_masks
+    return created_verts, created_masks, verts_B_neg, verts_B_pos
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -555,15 +570,22 @@ def _refine_barrier_adaptive(
     Uses an explicit queue so that resolved sub-cell vertex arrays are freed
     immediately rather than staying pinned on the call stack.
 
-    Queue items: (x_stars, vertices, worst_cond, remainder, depth_remaining)
+    Queue items: (x_stars, vertices, worst_cond, remainder, depth_remaining,
+                  bH, bb)
+    where bH/bb are the accumulated boundary hyperplanes for that sub-cell
+    (parent boundary + all cutting hyperplanes that carved it out).  This
+    ensures get_cell_hyperplanes_input_space knows about every face when
+    Enumerator_rapid is called on a deeper sub-cell.
     """
+    import warnings
     from collections import deque
 
     np_dtype = np.float64 if model_dtype == torch.float64 else np.float32
     n        = x_stars.shape[1]
 
     queue = deque()
-    queue.append((x_stars, vertices, worst_cond, remainder, max_depth))
+    queue.append((x_stars, vertices, worst_cond, remainder, max_depth,
+                  boundary_H, boundary_b))
 
     worst_M          = 0.0
     worst_r          = 0.0
@@ -571,7 +593,7 @@ def _refine_barrier_adaptive(
     any_inconclusive = False
 
     while queue:
-        xs, verts, wc, rem, depth = queue.popleft()
+        xs, verts, wc, rem, depth, bH, bb = queue.popleft()
 
         if depth == 0 or len(xs) < 2:
             any_inconclusive = True
@@ -599,13 +621,14 @@ def _refine_barrier_adaptive(
         step_proj = float((xs[idx_b] - xs[idx_a]) @ normal) / n_refs
         cuts      = [base_proj + k * step_proj for k in range(1, n_refs)]
 
-
         H_refine = np.tile(normal, (n_refs - 1, 1)).astype(np.float64)
         b_refine = np.array([-c for c in cuts], dtype=np.float64)
 
         # ── slice polytope ────────────────────────────────────────────────────
+        # Use the accumulated boundary (bH, bb) so that all faces carved by
+        # parent splits are known to get_cell_hyperplanes_input_space.
         H_cell, b_cell = get_cell_hyperplanes_input_space(
-            sv_i, layer_W, layer_b, boundary_H, boundary_b
+            sv_i, layer_W, layer_b, bH, bb
         )
         try:
             sub_cells = Enumerator_rapid(
@@ -614,9 +637,10 @@ def _refine_barrier_adaptive(
                 TH, [H_cell.tolist()], [b_cell.tolist()],
                 False, None, 0, use_wide,
             )
-        except Exception as exc:
+        except Exception:
             sub_cells = None
-
+        if cell_idx==75:
+            print("test")
         # ── Enumerator_rapid couldn't split ──────────────────────────────────
         if sub_cells is None or len(sub_cells) <= 1:
             _refine_stats["slab_fallback"] += 1
@@ -627,27 +651,35 @@ def _refine_barrier_adaptive(
             any_inconclusive = True
             continue
 
+        # Accumulate H_refine/b_refine into the boundary for child sub-cells
+        bH_child = np.vstack([bH, H_refine])
+        bb_child = np.concatenate([bb, b_refine])
+
         # ── process proper sub-cells ──────────────────────────────────────────
         _refine_stats["enumerator_ok"] += 1
+        zls_tol = 1e-3
         for sub_verts in sub_cells:
             sub_verts = np.asarray(sub_verts, dtype=np.float64)
             if len(sub_verts) < n + 1:
                 continue
 
+            # B=0 is an explicit boundary hyperplane of every sub-cell, so
+            # ZLS points appear directly as vertices with B(v)≈0 — no need
+            # to run _get_zero_level_set_crossings.
             with torch.no_grad():
-                B_sub = barrier_model(
+                B_sub_verts = barrier_model(
                     torch.tensor(sub_verts.astype(np_dtype), dtype=model_dtype)
                 ).numpy().ravel().astype(np.float64)
 
-            if B_sub.min() >= -1e-9 or B_sub.max() <= 1e-9:
-                continue   # no ZLS crossing — SAFE, discard immediately
+            xs_k = sub_verts[np.abs(B_sub_verts) < zls_tol]
 
-            xs_k, _ = _get_zero_level_set_crossings(
-                sub_verts, sv_i, B_sub,
-                layer_W, layer_b, boundary_H, boundary_b,
-                use_wide, barrier_model=barrier_model, model_dtype=model_dtype,
-            )
             if len(xs_k) == 0:
+                warnings.warn(
+                    f"[cell {cell_idx}] Sub-cell has no B≈0 vertices after "
+                    f"refinement — B=0 hyperplane may not have propagated "
+                    f"correctly into Enumerator_rapid."
+                )
+                any_inconclusive = True
                 continue
 
             label, M_i, r_i, rem_i, wc_i, ce = _two_step_label(
@@ -662,7 +694,8 @@ def _refine_barrier_adaptive(
 
             if label == Label.INCONCLUSIVE:
                 if len(xs_k) >= 2:
-                    queue.append((xs_k, sub_verts, wc_i, rem_i, depth - 1))
+                    queue.append((xs_k, sub_verts, wc_i, rem_i, depth - 1,
+                                  bH_child, bb_child))
                 else:
                     any_inconclusive = True
             # SAFE_TAYLOR: sub_verts goes out of scope here — freed immediately
@@ -688,7 +721,7 @@ def verify_barrier(
     dynamics_name       : str,
     continuous_time     : bool  = True,
     early_exit          : bool  = True,
-    refinement_max_depth: int   = 5,
+    refinement_max_depth: int   = 8,
     TH                  : list  = None,
 ) -> VerificationSummary:
     """
@@ -740,8 +773,8 @@ def verify_barrier(
                 torch.tensor(vertices.astype(np_dtype), dtype=model_dtype)
             ).numpy().ravel()
 
-        # Find zero level set crossings
-        x_stars, x_masks = _get_zero_level_set_crossings(
+        # Find zero level set crossings and the two ZLS sub-polytopes
+        x_stars, x_masks, verts_B_neg, verts_B_pos = _get_zero_level_set_crossings(
             vertices, sv_i, B_vals,
             layer_W, layer_b, boundary_H, boundary_b, use_wide,
             barrier_model=barrier_model,
@@ -763,12 +796,33 @@ def verify_barrier(
 
         # Adaptive refinement for INCONCLUSIVE cells
         if label == Label.INCONCLUSIVE:
+            # Build a ZLS-facet sub-cell: slice at B=0 gives two polytopes
+            # (B≤0 and B≥0 sides), both having x_stars as shared facet vertices.
+            # Encode the B=0 hyperplane p_i^T x + q_i = 0 as a boundary so that
+            # Enumerator_rapid inherits it, making ZLS vertices automatically
+            # present in every sub-cell without recomputing crossings.
+            v0   = vertices[0]
+            with torch.no_grad():
+                B_v0 = float(barrier_model(
+                    torch.tensor(v0[None].astype(np_dtype), dtype=model_dtype)
+                ).numpy().ravel()[0])
+            q_i = B_v0 - float(p_i @ v0)
+
+            zls_boundary_H = np.vstack([boundary_H, p_i[None, :]])
+            zls_boundary_b = np.append(boundary_b, q_i)
+
+            # Choose the sub-polytope with fewer vertices (simpler geometry)
+            sub_verts_for_refine = (
+                verts_B_neg if len(verts_B_neg) <= len(verts_B_pos) else verts_B_pos
+            )
+
             label, M_i, r_i, remainder, ce = _refine_barrier_adaptive(
                 x_stars, worst_cond, remainder,
                 p_i, barrier_model, dyn, hb,
                 i, continuous_time, use_wide,
                 refinement_max_depth,
-                vertices, sv_i, layer_W, layer_b, boundary_H, boundary_b, TH, model_dtype,
+                sub_verts_for_refine, sv_i, layer_W, layer_b,
+                zls_boundary_H, zls_boundary_b, TH, model_dtype,
             )
 
         if ce is not None and summary.counterexample is None:

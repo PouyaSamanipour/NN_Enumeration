@@ -86,7 +86,7 @@ summary_ref = verify_ref(
     dynamics_name=DYNAMICS,
     continuous_time=True,
     early_exit=False,
-    refinement_max_depth=3,
+    refinement_max_depth=5,
     TH=TH,
 )
 
