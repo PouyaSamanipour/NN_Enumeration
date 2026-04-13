@@ -41,7 +41,7 @@ from .hessian_bound import HessianBounder, compute_local_gradient
 
 from .bitwise_utils import Enumerator_rapid,finding_deep_hype, generate_mask_wide,slice_polytope_wide
 from .Dynamics import load_dynamics, list_systems
-from .verify_certificates import verify_barrier
+from .verify_certificate_new import verify_barrier
 from .verify_certificates import verify_lyapunov
 
 
@@ -341,7 +341,7 @@ def barrier_certificate_cells(model, enumerate_poly, hyperplanes, b, name_file,t
             # Boundary detection — single forward pass over all vertices.
             P_k = model(torch.tensor(poly_arr, dtype=model_dtype))
 
-            if P_k.min().item() < 1e-4 and P_k.max().item() > -1e-4:
+            if P_k.min().item() < 1e-5 and P_k.max().item() > 1e-5:
                 val["boundary_cells"] += 1
 
                 # Compute activation pattern from centroid.
@@ -878,9 +878,10 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
     if verification == "barrier" and len(BC) > 0:
         dynamics_name = name_file.split("/")[-1].split("_")[0].lower()
         summary = verify_barrier(
-            BC, sv, hyperplanes, b, W,bdh,bdb,
-            barrier_model, dynamics_name=dynamics_name
-    )
+            BC, sv, hyperplanes, b, W, bdh, bdb,
+            barrier_model, dynamics_name=dynamics_name,
+            TH=TH,
+        )
         from relu_region_enumerator.validate_with_nlp import validate_with_nlp
 
         report = validate_with_nlp(

@@ -334,6 +334,7 @@ def _two_step_label(
     p_i             : np.ndarray,
     cell_idx        : int,
     continuous_time : bool,
+    M_i_override    : Optional[float] = None,
 ) -> Tuple[Label, float, float, float, float, Optional[Counterexample]]:
     """
     Two-step labeling on a set of zero level set crossing points.
@@ -390,7 +391,10 @@ def _two_step_label(
             ).numpy().ravel()
 
     distances   = np.linalg.norm(x_stars - c_star, axis=1)
-    M_i         = hb.bound(p_i, x_stars)
+    # Reuse parent cell's M_i when provided — valid because sub-cells are
+    # contained in the parent, so the parent bound is still an upper bound.
+    # The remainder still shrinks because r decreases with each split.
+    M_i         = M_i_override if M_i_override is not None else hb.bound(p_i, x_stars)
     remainders  = 0.5 * M_i * distances ** 2
     worst_safe  = float((cond_vals + remainders).max())
     best_unsafe = float((cond_vals - remainders).min())
@@ -515,6 +519,31 @@ def _find_edge_zls(verts: np.ndarray, B_vals: np.ndarray) -> np.ndarray:
 
 
 @njit
+def _find_farthest_pair_nb(xs: np.ndarray) -> Tuple[int, int, float]:
+    """Find the pair of points in xs with maximum pairwise distance (JIT).
+
+    Avoids the O(E²×n) intermediate array that numpy broadcasting would create.
+    Returns (idx_a, idx_b, max_dist).
+    """
+    E = xs.shape[0]
+    n = xs.shape[1]
+    best_d2 = -1.0
+    ia = 0
+    ib = 1
+    for i in range(E):
+        for j in range(i + 1, E):
+            d2 = 0.0
+            for k in range(n):
+                diff = xs[i, k] - xs[j, k]
+                d2 += diff * diff
+            if d2 > best_d2:
+                best_d2 = d2
+                ia = i
+                ib = j
+    return ia, ib, best_d2 ** 0.5
+
+
+@njit
 def _centroid_and_radius_nb(verts: np.ndarray) -> Tuple[np.ndarray, float]:
     """Compute centroid and max distance from centroid (JIT)."""
     V = verts.shape[0]
@@ -547,6 +576,7 @@ def _refine_barrier_adaptive(
     x_stars         : np.ndarray,
     worst_cond      : float,
     remainder       : float,
+    M_i_parent      : float,
     p_i             : np.ndarray,
     barrier_model,
     dyn             : DynamicsEvaluator,
@@ -599,14 +629,10 @@ def _refine_barrier_adaptive(
             any_inconclusive = True
             continue
 
-        E = len(xs)
-
         # ── find farthest pair of ZLS points ─────────────────────────────────
-        diff     = xs[:, None, :] - xs[None, :, :]
-        dmat     = np.linalg.norm(diff, axis=2)
-        flat     = int(np.argmax(dmat))
-        idx_a, idx_b = divmod(flat, E)
-        max_dist = float(dmat[idx_a, idx_b])
+        idx_a, idx_b, max_dist = _find_farthest_pair_nb(
+            np.ascontiguousarray(xs, dtype=np.float64)
+        )
 
         if max_dist < 1e-12:
             any_inconclusive = True
@@ -639,8 +665,6 @@ def _refine_barrier_adaptive(
             )
         except Exception:
             sub_cells = None
-        if cell_idx==75:
-            print("test")
         # ── Enumerator_rapid couldn't split ──────────────────────────────────
         if sub_cells is None or len(sub_cells) <= 1:
             _refine_stats["slab_fallback"] += 1
@@ -683,7 +707,8 @@ def _refine_barrier_adaptive(
                 continue
 
             label, M_i, r_i, rem_i, wc_i, ce = _two_step_label(
-                xs_k, barrier_model, dyn, hb, p_i, cell_idx, continuous_time
+                xs_k, barrier_model, dyn, hb, p_i, cell_idx, continuous_time,
+                M_i_override=M_i_parent,
             )
             worst_M   = max(worst_M,   M_i)
             worst_r   = max(worst_r,   r_i)
@@ -818,6 +843,7 @@ def verify_barrier(
 
             label, M_i, r_i, remainder, ce = _refine_barrier_adaptive(
                 x_stars, worst_cond, remainder,
+                M_i,  # reuse parent Hessian bound — valid for all sub-cells
                 p_i, barrier_model, dyn, hb,
                 i, continuous_time, use_wide,
                 refinement_max_depth,

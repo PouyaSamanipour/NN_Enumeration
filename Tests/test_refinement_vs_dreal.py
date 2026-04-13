@@ -25,7 +25,7 @@ Requirements
 
 from __future__ import annotations
 
-import sys, os, subprocess, tempfile, time
+import sys, os, subprocess, tempfile, time, cProfile, pstats
 sys.path.insert(0, os.path.dirname(__file__))
 
 import numpy as np
@@ -37,8 +37,10 @@ from relu_region_enumerator.verify_certificate_new import (
     verify_barrier as verify_ref,
     Label as LabelRef,
     DynamicsEvaluator,
+    _get_zero_level_set_crossings,
+    _two_step_label,
 )
-from relu_region_enumerator.hessian_bound import compute_local_gradient
+from relu_region_enumerator.hessian_bound import HessianBounder, compute_local_gradient
 from relu_region_enumerator.Dynamics import load_dynamics
 from relu_region_enumerator.bitwise_utils import get_cell_hyperplanes_input_space
 
@@ -294,75 +296,121 @@ if __name__ == "__main__":
     model_dtype = next(model.parameters()).dtype
     np_dtype    = np.float64 if model_dtype == torch.float64 else np.float32
 
-    # ── Run refinement ────────────────────────────────────────────────────
+    # ── Run refinement (profiled) ─────────────────────────────────────────
     print("=" * 60)
     print("RUN 1 — Adaptive refinement")
     print("=" * 60)
+    _prof = cProfile.Profile()
+    _prof.enable()
     summary_ref = verify_ref(
         BC, sv, layer_W, layer_b, W_out,
         boundary_H, boundary_b, model,
         dynamics_name=DYNAMICS,
         continuous_time=True,
         early_exit=False,
-        refinement_max_depth=6,
+        refinement_max_depth=8,
         TH=TH,
     )
+    _prof.disable()
+    _PROF_PATH = os.path.join(os.path.dirname(__file__), "refinement.prof")
+    _prof.dump_stats(_PROF_PATH)
+    print(f"\n  Profile saved → {_PROF_PATH}")
+    print("  Run:  snakeviz", _PROF_PATH)
+    # Quick text summary (top 20 by cumulative time)
+    _ps = pstats.Stats(_prof, stream=sys.stdout).sort_stats("cumulative")
+    _ps.print_stats(20)
 
-    # ── Run dReal per cell ────────────────────────────────────────────────
+    # ── Run Taylor + dReal only when Taylor is inconclusive ───────────────
     print("\n" + "=" * 60)
-    print("RUN 2 — dReal ground truth (full polytope constraints)")
+    print("RUN 2 — Taylor check; dReal only when Taylor is inconclusive")
     print("=" * 60)
 
-    ref_map       = {r.cell_idx: r.label for r in summary_ref.results}
-    dreal_map     = {}
-    dreal_time_map= {}
-    n_safe_dr     = 0
-    n_unsafe_dr   = 0
-    n_timeout_dr  = 0
-    n_error_dr    = 0
-    total_dr_time = 0.0
+    ref_map    = {r.cell_idx: r.label for r in summary_ref.results}
+    hb         = HessianBounder(symbols, f_sym)
+    total_neurons = sum(W.shape[0] for W in layer_W)
+    use_wide      = (total_neurons + len(boundary_H) > 64)
+
+    dreal_map        = {}
+    dreal_time_map   = {}
+    taylor_label_map = {}   # raw Taylor label before dReal
+    n_safe_taylor    = 0
+    n_unsafe_taylor  = 0
+    n_safe_dreal     = 0
+    n_unsafe_dreal   = 0
+    n_timeout_dr     = 0
+    n_error_dr       = 0
+    total_dr_time    = 0.0
 
     for i, vertices in enumerate(BC):
         vertices = np.asarray(vertices, dtype=float)
         sv_i     = sv[i].ravel()
         p_i      = compute_local_gradient(sv_i, layer_W, W_out)
 
-        # Check if cell crosses B=0
         with torch.no_grad():
             B_vals = model(
                 torch.tensor(vertices.astype(np_dtype), dtype=model_dtype)
             ).numpy().ravel()
 
-        if B_vals.min() >= -1e-9 or B_vals.max() <= 1e-9:
-            dreal_map[i]      = "SAFE"
-            dreal_time_map[i] = 0.0
-            n_safe_dr        += 1
-            continue
-
-        dr_label, dr_rt = verify_cell_dreal(
-            vertices, sv_i, p_i,
-            layer_W, layer_b,
-            boundary_H, boundary_b,
-            symbols, f_sym, model,
-            TH=TH,
-            delta=DREAL_DELTA,
-            timeout=DREAL_TIMEOUT,
+        # Find ZLS crossings
+        x_stars, x_masks, verts_B_neg, verts_B_pos = _get_zero_level_set_crossings(
+            vertices, sv_i, B_vals,
+            layer_W, layer_b, boundary_H, boundary_b, use_wide,
+            barrier_model=model,
+            model_dtype=model_dtype,
         )
 
-        dreal_map[i]      = dr_label
-        dreal_time_map[i] = dr_rt
-        total_dr_time    += dr_rt
+        if len(x_stars) == 0:
+            taylor_label_map[i] = LabelRef.SAFE_TAYLOR
+            dreal_map[i]        = "SAFE"
+            dreal_time_map[i]   = 0.0
+            n_safe_taylor      += 1
+            continue
 
-        if   dr_label == "SAFE":    n_safe_dr    += 1
-        elif dr_label == "UNSAFE":  n_unsafe_dr  += 1
-        elif dr_label == "TIMEOUT": n_timeout_dr += 1
-        else:                       n_error_dr   += 1
+        # Taylor two-step check
+        t_label, M_i, r_i, remainder, worst_cond, ce = _two_step_label(
+            x_stars, model, dyn, hb, p_i, i, continuous_time=True
+        )
+        taylor_label_map[i] = t_label
 
-        print(f"  cell {i:4d}  dReal={dr_label:<8s}  "
-              f"ref={ref_map.get(i,'?').value:<22s}  "
-              f"time={dr_rt:.3f}s")
+        if t_label == LabelRef.SAFE_TAYLOR:
+            dreal_map[i]      = "SAFE"
+            dreal_time_map[i] = 0.0
+            n_safe_taylor    += 1
 
-    print(f"\n  dReal: SAFE={n_safe_dr}  UNSAFE={n_unsafe_dr}  "
+        elif t_label == LabelRef.UNSAFE:
+            dreal_map[i]      = "UNSAFE"
+            dreal_time_map[i] = 0.0
+            n_unsafe_taylor  += 1
+            print(f"  cell {i:4d}  Taylor=UNSAFE  (dReal skipped)  "
+                  f"ref={ref_map.get(i, '?').value}")
+
+        else:   # INCONCLUSIVE — call dReal
+            dr_label, dr_rt = verify_cell_dreal(
+                vertices, sv_i, p_i,
+                layer_W, layer_b,
+                boundary_H, boundary_b,
+                symbols, f_sym, model,
+                TH=TH,
+                delta=DREAL_DELTA,
+                timeout=DREAL_TIMEOUT,
+            )
+            dreal_map[i]      = dr_label
+            dreal_time_map[i] = dr_rt
+            total_dr_time    += dr_rt
+
+            if   dr_label == "SAFE":    n_safe_dreal  += 1
+            elif dr_label == "UNSAFE":  n_unsafe_dreal += 1
+            elif dr_label == "TIMEOUT": n_timeout_dr   += 1
+            else:                       n_error_dr     += 1
+
+            print(f"  cell {i:4d}  Taylor=INCONCLUSIVE  dReal={dr_label:<8s}  "
+                  f"ref={ref_map.get(i, '?').value:<22s}  time={dr_rt:.3f}s")
+
+    n_safe_dr   = n_safe_taylor  + n_safe_dreal
+    n_unsafe_dr = n_unsafe_taylor + n_unsafe_dreal
+    print(f"\n  Taylor: SAFE={n_safe_taylor}  UNSAFE={n_unsafe_taylor}  "
+          f"INCONCLUSIVE→dReal={n_safe_dreal + n_unsafe_dreal + n_timeout_dr + n_error_dr}")
+    print(f"  dReal (inconclusive cells): SAFE={n_safe_dreal}  UNSAFE={n_unsafe_dreal}  "
           f"TIMEOUT={n_timeout_dr}  ERROR={n_error_dr}")
     print(f"  Total dReal time: {total_dr_time:.1f}s")
 
@@ -373,8 +421,8 @@ if __name__ == "__main__":
 
     def coarse(label):
         v = label.value
+        if "UNSAFE" in v: return "UNSAFE"   # must precede "SAFE" check ("SAFE" ⊂ "UNSAFE")
         if "SAFE"   in v: return "SAFE"
-        if "UNSAFE" in v: return "UNSAFE"
         return "INCONCLUSIVE"
 
     conflicts     = []
@@ -414,20 +462,25 @@ if __name__ == "__main__":
         for idx, lr, ld in disagreements[:10]:
             print(f"    cell {idx:5d}  ref={lr:<25s}  dReal={ld}")
 
+    n_dreal_called = n_safe_dreal + n_unsafe_dreal + n_timeout_dr + n_error_dr
     print(f"\n{'='*60}")
-    print(f"{'Metric':<40} {'Refinement':>12} {'dReal':>8}")
+    print(f"{'Metric':<42} {'Refinement':>12} {'Taylor+dReal':>12}")
     print(f"{'='*60}")
-    print(f"{'SAFE (Taylor)':<40} {summary_ref.n_safe_taylor:>12} {'—':>8}")
-    print(f"{'SAFE (Refinement)':<40} {summary_ref.n_safe_refinement:>12} {n_safe_dr:>8}")
-    print(f"{'SAFE total':<40} {summary_ref.n_safe:>12} {n_safe_dr:>8}")
-    print(f"{'UNSAFE':<40} {summary_ref.n_unsafe:>12} {n_unsafe_dr:>8}")
-    print(f"{'INCONCLUSIVE':<40} {summary_ref.n_inconclusive:>12} {'—':>8}")
-    print(f"{'Runtime (s)':<40} {summary_ref.runtime_s:>12.2f} {total_dr_time:>8.2f}")
+    print(f"{'SAFE (Taylor only)':<42} {summary_ref.n_safe_taylor:>12} {n_safe_taylor:>12}")
+    print(f"{'SAFE (Refinement / dReal fallback)':<42} {summary_ref.n_safe_refinement:>12} {n_safe_dreal:>12}")
+    print(f"{'SAFE total':<42} {summary_ref.n_safe:>12} {n_safe_dr:>12}")
+    print(f"{'UNSAFE (Taylor)':<42} {'—':>12} {n_unsafe_taylor:>12}")
+    print(f"{'UNSAFE (dReal fallback)':<42} {'—':>12} {n_unsafe_dreal:>12}")
+    print(f"{'UNSAFE total':<42} {summary_ref.n_unsafe:>12} {n_unsafe_dr:>12}")
+    print(f"{'INCONCLUSIVE (Taylor→full refine)':<42} {summary_ref.n_inconclusive:>12} {'—':>12}")
+    print(f"{'TIMEOUT/ERROR (Taylor→dReal)':<42} {'—':>12} {n_timeout_dr + n_error_dr:>12}")
+    print(f"{'dReal calls made':<42} {'—':>12} {n_dreal_called:>12}")
+    print(f"{'Runtime (s)':<42} {summary_ref.runtime_s:>12.2f} {total_dr_time:>12.2f}")
     print(f"{'='*60}")
 
     print()
     if len(conflicts) == 0:
-        print("CONCLUSION: Adaptive refinement is SOUND with respect to dReal.")
+        print("CONCLUSION: Taylor+dReal hybrid is SOUND with respect to full refinement.")
         if len(disagreements) > 0:
             print(f"  {len(disagreements)} cells: refinement found violation, "
                   f"dReal missed — refinement more sensitive for falsification.")

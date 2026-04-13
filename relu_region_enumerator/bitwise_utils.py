@@ -76,6 +76,27 @@ def generate_mask(vertices, hyperplanes, b, tolerance=1e-7):
     return masks
 
 
+@njit
+def generate_mask_serial(vertices, hyperplanes, b, tolerance=1e-7):
+    """Serial version of generate_mask — faster for small vertex counts.
+
+    Avoids numba thread-pool overhead that dominates when V is small
+    (typical for refinement sub-cells).  Use generate_mask for V >= 200.
+    """
+    n_verts  = vertices.shape[0]
+    n_planes = hyperplanes.shape[0]
+    masks = np.zeros(n_verts, dtype=np.uint64)
+    for i in range(n_verts):
+        mask = np.uint64(0)
+        v    = vertices[i]
+        for h in range(n_planes):
+            val = hyperplanes[h, :] @ v + b[h]
+            if np.abs(val) <= tolerance:
+                mask = mask | (np.uint64(1) << np.uint64(h))
+        masks[i] = mask
+    return masks
+
+
 # ---------------------------------------------------------------------------
 # Polytope slicing — serial JIT version (small polytopes, len(masks) < 1000)
 # ---------------------------------------------------------------------------
@@ -485,13 +506,15 @@ def Enumerator_rapid(
         # Global bit index of the current hyperplane across the boundary set.
         global_bit_index = i + len(boundary_hyperplanes[0])
 
+        # Build bh/bb once per i — they don't change within the j loop.
+        bh = np.array(boundary_hyperplanes[0])
+        bb = np.array(border_bias[0])
+
         # ---- Slicing loop ----
         for j in range(len(enumerate_poly)):
             if sgn_var[j] < -1e-9:
                 hyperplane_val = np.dot(enumerate_poly[j], hyperplanes[i].T) + b[i]
                 verts = np.array(enumerate_poly[j])
-                bh    = np.array(boundary_hyperplanes[0])
-                bb    = np.array(border_bias[0])
 
                 if use_wide:
                     # Wide path: multi-word uint64 masks, pure Python/NumPy.
@@ -505,7 +528,12 @@ def Enumerator_rapid(
                     )
                 else:
                     # Fast path: scalar uint64 masks, Numba JIT.
-                    masks = generate_mask(verts, bh, bb, tolerance=1e-10)
+                    # Use serial version for small polytopes — parallel thread
+                    # overhead dominates when vertex count is low.
+                    if len(verts) < 200:
+                        masks = generate_mask_serial(verts, bh, bb, tolerance=1e-10)
+                    else:
+                        masks = generate_mask(verts, bh, bb, tolerance=1e-10)
                     if len(masks) < 1000:
                         polytops_test, _, created_verts = slice_polytope_with_hyperplane(
                             verts,

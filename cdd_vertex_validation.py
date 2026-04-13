@@ -468,7 +468,7 @@ def run_trial_with_cdd(n, m1, m2, seed, domain, slack, tol=1e-5):
 
     # Import enumerator from existing script
     try:
-        from lp_ground_truth_deep import run_enumerator_deep
+        from Tests.lp_ground_truth_deep import run_enumerator_deep
         cells, n_enum, t_enum = run_enumerator_deep(H1, b1, H2, b2, TH)
     except ImportError:
         print("lp_ground_truth_deep not found — provide cells manually.")

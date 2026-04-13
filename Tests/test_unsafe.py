@@ -4,7 +4,7 @@ sys.path.insert(0, '/home/pouya/Codes/NN_Enumeration')
 from relu_region_enumerator.hessian_bound import compute_local_gradient
 from relu_region_enumerator.Dynamics import load_dynamics
 from relu_region_enumerator.bitwise_utils import get_cell_hyperplanes_input_space
-from test_refinement_vs_dreal import build_smt2, call_dreal
+from Tests.test_refinement_vs_dreal import build_smt2, call_dreal
 
 # ── reload everything ─────────────────────────────────────────────────────
 model = torch.jit.load("NN_files/model_decay_2_10_ren.pt", map_location="cpu")
