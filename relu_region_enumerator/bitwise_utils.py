@@ -37,6 +37,8 @@ from numba import njit, prange
 from numba import types  # noqa: F401  (kept for potential extension)
 from numba.typed import List  # noqa: F401
 
+from .ibp_filter import vertex_ibp_filter
+
 
 # ---------------------------------------------------------------------------
 # Bitmask generation
@@ -447,6 +449,10 @@ def Enumerator_rapid(
     D,
     m,
     use_wide=False,
+    W_pos_ibp=None,
+    W_neg_ibp=None,
+    b_arr_ibp=None,
+    is_last_layer=False,
 ):
     """Enumerate all linear regions produced by one layer of ReLU hyperplanes.
 
@@ -490,6 +496,8 @@ def Enumerator_rapid(
     enumerate_poly = list(original_polytope_test)
 
     for i in range(len(hyperplanes)):
+        if not enumerate_poly:
+            break
         intact_poly = []
         poly_dummy  = []
         n = len(enumerate_poly[0][0])
@@ -562,21 +570,29 @@ def Enumerator_rapid(
                         )
 
                 if len(created_verts) > n - 1:
-                    result = Polytope_formation_hd(
-                        enumerate_poly[j],
-                        np.array(hyperplane_val),
-                        TH,
-                        np.array(created_verts),
-                        polytops_test,
-                    )
+                    result = list(polytops_test)
                 else:
                     result = [enumerate_poly[j]]
 
+                
                 poly_dummy.extend(result)
             else:
                 intact_poly.append(enumerate_poly[j])
-
         intact_poly.extend(poly_dummy)
+
+        # Per-hyperplane IBP filter on all polytopes (split and non-split).
+        # On the final hyperplane: layer m is fully processed → n_known = m+1
+        # and is_last_layer is forwarded from the caller, enabling the exact
+        # vertex sign check on the final layer instead of IBP approximation.
+        if W_pos_ibp is not None and len(intact_poly) > 1:
+            is_final_hyperplane = (i == len(hyperplanes) - 1)
+            intact_poly, _ = vertex_ibp_filter(
+                intact_poly, W_pos_ibp, W_neg_ibp, b_arr_ibp,
+                is_last_layer=(is_last_layer and is_final_hyperplane),
+                n_known=m + 1 if is_final_hyperplane else m,
+                verbose=False,
+            )
+
         boundary_hyperplanes[0] = np.vstack(
             (boundary_hyperplanes[0], hyperplanes[i])
         ).tolist()
@@ -626,123 +642,6 @@ def generate_mask_wide(vertices, hyperplanes, b, tolerance=1e-7):
     return masks
 
 
-# def _wide_popcount_ge(mask_u, mask_v, req_shared, num_words):
-#     """Return True if bitwise AND of two wide masks has >= req_shared bits set.
-
-#     Uses Kernighan's bit-clearing trick word by word with early exit.
-
-#     Parameters
-#     ----------
-#     mask_u, mask_v : (num_words,) uint64 arrays
-#     req_shared     : int -- minimum shared bit count required
-#     num_words      : int
-
-#     Returns
-#     -------
-#     bool
-#     """
-#     count = 0
-#     ONE = np.uint64(1)
-#     for w in range(num_words):
-#         temp = mask_u[w] & mask_v[w]
-#         while temp > np.uint64(0):
-#             temp &= temp - ONE
-#             count += 1
-#             if count >= req_shared:
-#                 return True
-#     return False
-
-
-# def _wide_mask_or_and(shared_u, mask_u, bit_index, num_words):
-#     """Compute ``shared_u | (mask_u & (1 << bit_index))`` for wide masks.
-
-#     This replicates the intersection-mask assignment from the narrow slicer:
-#     the new vertex inherits shared bits plus any pre-existing bit for the
-#     current hyperplane that vertex u already carried.
-
-#     Parameters
-#     ----------
-#     shared_u  : (num_words,) uint64 array -- mask_u & mask_v
-#     mask_u    : (num_words,) uint64 array
-#     bit_index : int -- global hyperplane index
-#     num_words : int
-
-#     Returns
-#     -------
-#     (num_words,) uint64 array
-#     """
-#     result = shared_u.copy()
-#     word = bit_index // 64
-#     bit  = bit_index % 64
-#     result[word] |= mask_u[word] & (np.uint64(1) << np.uint64(bit))
-#     return result
-
-
-# def slice_polytope_wide(enumerate_poly, hyperplane_val, masks_w, i, n):
-#     """Slice a polytope using wide (multi-word) bitmask adjacency.
-
-#     Mirrors the logic of :func:`slice_polytope_with_hyperplane` exactly,
-#     but operates on (V, num_words) mask arrays instead of scalar uint64.
-
-#     Parameters
-#     ----------
-#     enumerate_poly : (V, n) float64 array
-#     hyperplane_val : (V,)   float64 array
-#     masks_w        : (V, num_words) uint64 array
-#     i              : int -- global bit index of the current hyperplane
-#     n              : int -- input dimension
-
-#     Returns
-#     -------
-#     polytopes     : list of two (V_k, n) arrays -- [inside, outside]
-#     mask_lists    : list of two (V_k, num_words) arrays
-#     created_verts : (E, n) float64 array
-#     """
-#     num_words  = masks_w.shape[1]
-#     req_shared = n - 1
-
-#     strict_index_in  = np.where(hyperplane_val < -1e-9)[0]
-#     strict_index_out = np.where(hyperplane_val >  1e-9)[0]
-#     index_in  = np.where(hyperplane_val <= 1e-5)[0]
-#     index_out = np.where(hyperplane_val >= -1e-5)[0]
-
-#     max_new = len(index_in) * len(index_out)
-#     new_verts_buffer = np.zeros((max_new, n),         dtype=np.float64)
-#     new_masks_buffer = np.zeros((max_new, num_words),  dtype=np.uint64)
-#     count = 0
-
-#     for k in range(len(strict_index_in)):
-#         u_idx  = strict_index_in[k]
-#         mask_u = masks_w[u_idx]
-
-#         for l in range(len(strict_index_out)):
-#             v_idx = strict_index_out[l]
-
-#             if hyperplane_val[u_idx] < -1e-9 and hyperplane_val[v_idx] > 1e-9:
-#                 mask_v      = masks_w[v_idx]
-#                 shared_mask = mask_u & mask_v   # element-wise, shape (num_words,)
-
-#                 if _wide_popcount_ge(mask_u, mask_v, req_shared, num_words):
-#                     d1 = hyperplane_val[u_idx]
-#                     d2 = hyperplane_val[v_idx]
-#                     t  = -d1 / (d2 - d1)
-#                     new_verts_buffer[count] = enumerate_poly[u_idx] + t * (
-#                         enumerate_poly[v_idx] - enumerate_poly[u_idx]
-#                     )
-#                     new_masks_buffer[count] = _wide_mask_or_and(
-#                         shared_mask, mask_u, i, num_words
-#                     )
-#                     count += 1
-
-#     created_verts = new_verts_buffer[:count]
-#     created_masks = new_masks_buffer[:count]
-
-#     verts_in  = np.vstack((enumerate_poly[index_in],  created_verts))
-#     masks_in  = np.vstack((masks_w[index_in],  created_masks))
-#     verts_out = np.vstack((enumerate_poly[index_out], created_verts))
-#     masks_out = np.vstack((masks_w[index_out], created_masks))
-
-#     return [verts_in, verts_out], [masks_in, masks_out], created_verts
 
 @njit
 def _wide_popcount_ge(mask_u, mask_v, req_shared, num_words):

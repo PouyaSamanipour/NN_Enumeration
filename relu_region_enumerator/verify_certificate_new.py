@@ -42,6 +42,7 @@ Usage
 
 from __future__ import annotations
 
+import gc
 import time
 import numpy as np
 import torch
@@ -662,12 +663,19 @@ def _refine_barrier_adaptive(
         H_cell, b_cell = get_cell_hyperplanes_input_space(
             sv_i, layer_W, layer_b, bH, bb
         )
+        
+        # bH grows at each refinement depth, so the total hyperplane count
+        # (boundary + refine cuts) can exceed 64 even when use_wide was False
+        # at the top level.  Recompute locally to avoid uint64 bitmask overflow,
+        # which causes spurious adjacency hits and an explosion of intersection
+        # vertices.
+        use_wide_cell = (len(H_cell) + len(H_refine)) > 64
         try:
             sub_cells = Enumerator_rapid(
                 H_refine, b_refine,
                 [np.asarray(verts, dtype=np.float64)],
                 TH, [H_cell.tolist()], [b_cell.tolist()],
-                False, None, 0, use_wide,
+                False, None, 0, use_wide_cell,
             )
         except Exception:
             sub_cells = None
@@ -712,9 +720,14 @@ def _refine_barrier_adaptive(
                 any_inconclusive = True
                 continue
 
+            # Use the parent Hessian bound when n_refs is already small — it
+            # is a valid upper bound and avoids an expensive hb.bound() call.
+            # When n_refs is large the parent bound is too conservative: recompute
+            # locally so a tighter M_i reduces n_refs and limits vertex explosion.
+            m_override = M_i_parent if n_refs <= 1 else None
             label, M_i, r_i, rem_i, wc_i, ce = _two_step_label(
                 xs_k, barrier_model, dyn, hb, p_i, cell_idx, continuous_time,
-                M_i_override=M_i_parent,
+                M_i_override=m_override,
             )
             worst_M   = max(worst_M,   M_i)
             worst_r   = max(worst_r,   r_i)
@@ -808,8 +821,11 @@ def verify_barrier(
           f"use_wide={use_wide}, max_depth={refinement_max_depth}")
     t0 = time.perf_counter()
 
-    for i, vertices in enumerate(BC):
-        vertices = np.asarray(vertices, dtype=float)
+    for i in range(len(BC)):
+        if i==5093:
+            print("debug")
+        vertices = np.asarray(BC[i], dtype=float)
+        BC[i]    = None   # release vertex array immediately — no longer needed
         sv_i     = sv[i].ravel()
         p_i      = compute_local_gradient(sv_i, layer_W, W_out)
 
@@ -860,6 +876,17 @@ def verify_barrier(
         )
 
         # Adaptive refinement for INCONCLUSIVE cells
+        # if label == Label.INCONCLUSIVE and len(vertices) > 300:
+        #     # Cell is too geometrically complex for safe refinement — each
+        #     # hyperplane cut can generate O(n*V) intersection vertices,
+        #     # compounding exponentially across depth levels.
+        #     summary.n_inconclusive += 1
+        #     summary.results.append(CellResult(
+        #         label=Label.INCONCLUSIVE, cell_idx=i,
+        #         M_i=M_i, r_i=r_i, remainder=remainder, max_condition=0.0,
+        #     ))
+        #     continue
+
         if label == Label.INCONCLUSIVE:
             # Build a ZLS-facet sub-cell: slice at B=0 gives two polytopes
             # (B≤0 and B≥0 sides), both having x_stars as shared facet vertices.

@@ -627,6 +627,7 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
             if j % 1000 == 0:
                 print(f"  Layer {i}: processing cell {j} / {N_j}")
 
+            _is_last_layer = _run_ibp and (i == num_hidden_layers - 1)
             if i == 0:
                 # First layer: all polytopes share the same input domain.
                 enumerate_poly_n = Enumerator_rapid(
@@ -635,6 +636,10 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
                     [border_hyperplane], [border_bias],
                     parallel, np.array([1] * n_h), i,
                     use_wide=use_wide,
+                    W_pos_ibp=W_pos_ibp if _run_ibp else None,
+                    W_neg_ibp=W_neg_ibp if _run_ibp else None,
+                    b_arr_ibp=b_arr_ibp if _run_ibp else None,
+                    is_last_layer=_is_last_layer,
                 )
             else:
                 # Deeper layers: read cell j from HDF5 (disk path) or RAM.
@@ -656,6 +661,10 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
                     False,  # serial: single polytope → parallel overhead > benefit
                     np.array([1] * n_h), i,
                     use_wide=use_wide,
+                    W_pos_ibp=W_pos_ibp if _run_ibp else None,
+                    W_neg_ibp=W_neg_ibp if _run_ibp else None,
+                    b_arr_ibp=b_arr_ibp if _run_ibp else None,
+                    is_last_layer=_is_last_layer,
                 )
 
             if use_disk:
@@ -811,9 +820,23 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
                     print(f"  [Filter] Layer {i} (last): vertex check exact.")
                 del cells_before
 
-    # Clean up any leftover input HDF5 from the last layer.
-    if use_disk and _in_h5_path is not None and os.path.exists(_in_h5_path):
-        os.remove(_in_h5_path)
+    # For the disk path, load the final surviving polytopes back into memory
+    # (the last filtered_*.h5 holds the output of the IBP filter on the last layer).
+    # Then delete the scratch file.
+    if use_disk:
+        if _in_h5_path is not None and os.path.exists(_in_h5_path):
+            offs_final = np.array(_in_offsets)
+            with h5py.File(_in_h5_path, "r") as hf:
+                ds_final = hf["vertices"]
+                enumerate_poly = [
+                    ds_final[offs_final[k]:offs_final[k + 1]][:]
+                    for k in range(_in_N)
+                ]
+            os.remove(_in_h5_path)
+            _in_h5_path = None
+        else:
+            # File already gone or never written (0 survivors).
+            enumerate_poly = []
     
     
     
@@ -864,165 +887,11 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
             ds[file_offsets[idx]:file_offsets[idx + 1]] = p
     print(f"Polytope vertex data saved to: {out_h5}")
 
-    
+    # Free enumerate_poly before verification — BC is a subset of it and
+    # both would otherwise live in memory simultaneously during verify_barrier.
+    del enumerate_poly
+    gc.collect()
 
-
-
-
-
-
-    # #### test Hessian of dynamics
-    # # ── Algebraic Decay verification (using ZLS centroid) ────────────────────
-    # print("\nAlgebraic Decay verification:")
-    # violations = []
-    # model_dtype = next(barrier_model.parameters()).dtype
-    # np_dtype    = np.float64 if model_dtype == torch.float64 else np.float32
-    # cell_idx = 0
-    # sv_i = sv[cell_idx].ravel()
-    # p_i  = compute_local_gradient(sv_i, hyperplanes, W)
-
-    # # Compare with autograd
-    # vertices = np.asarray(BC[cell_idx], dtype=np.float64)
-    # zls_points = []
-    # B_verts = barrier_model(
-    #     torch.tensor(vertices.astype(np_dtype), dtype=model_dtype)
-    # ).detach().numpy().ravel()
-
-    # for i in range(len(vertices)):
-    #     for j in range(i+1, len(vertices)):
-    #         if B_verts[i] * B_verts[j] < 0:
-    #             t = B_verts[i] / (B_verts[i] - B_verts[j])
-    #             zls_points.append(vertices[i] + t*(vertices[j] - vertices[i]))
-
-    # x_star = np.mean(zls_points, axis=0)
-    # x_t    = torch.tensor(x_star.astype(np_dtype)[None,:], 
-    #                     dtype=model_dtype, requires_grad=True)
-    # B_val  = barrier_model(x_t)
-    # B_val.backward()
-    # p_autograd = x_t.grad.detach().numpy().ravel()
-
-    # print(f"p_i from compute_local_gradient: {p_i}")
-    # print(f"p_i from autograd              : {p_autograd}")
-    # print(f"match: {np.allclose(p_i, p_autograd, atol=1e-6)}")
-    # print(f"lie via compute_local_gradient : {float(p_i @ (-x_star*(1+np.sum(x_star**2)))):.8f}")
-    # print(f"lie via autograd               : {float(p_autograd @ (-x_star*(1+np.sum(x_star**2)))):.8f}")
-
-
-
-    # # What x* does verify_barrier find for cell 0?
-    # from .verify_certificates import _get_zero_level_set_crossings
-
-    # cell_idx = 0
-    # vertices = np.asarray(BC[cell_idx], dtype=np.float64)
-    # sv_i     = sv[cell_idx].ravel()
-
-    # x_stars, x_masks = _get_zero_level_set_crossings(vertices, sv_i, barrier_model, model_dtype)
-
-    # print(f"Number of ZLS crossing points: {len(x_stars)}")
-    # for k, x in enumerate(x_stars):
-    #     with torch.no_grad():
-    #         B_val = float(barrier_model(
-    #             torch.tensor(x.astype(np_dtype)[None,:], dtype=model_dtype)
-    #         ).item())
-    #     r2  = float(np.sum(x**2))
-    #     f_x = -x * (1 + r2)
-    #     lie = float(p_i @ f_x)
-    #     print(f"  x*[{k}] = {x}")
-    #     print(f"         B(x*) = {B_val:.2e}  lie = {lie:.6f}")
-    # for cell_idx in range(len(BC)):
-    #     sv_i     = sv[cell_idx].ravel()
-    #     p_i      = compute_local_gradient(sv_i, hyperplanes, W)
-    #     vertices = np.asarray(BC[cell_idx], dtype=np.float64)
-
-    #     # Evaluate B at all vertices
-    #     with torch.no_grad():
-    #         B_verts = barrier_model(
-    #             torch.tensor(vertices.astype(np_dtype), dtype=model_dtype)
-    #         ).detach().numpy().ravel().astype(np.float64)
-
-    #     # ZLS centroid: average of the ZLS crossing points on each edge
-    #     # For each edge (v_i, v_j) where B changes sign, interpolate x* = v_i - B_i/(B_j-B_i)*(v_j-v_i)
-    #     zls_points = []
-    #     n_verts = len(vertices)
-    #     for i in range(n_verts):
-    #         for j in range(i+1, n_verts):
-    #             Bi, Bj = B_verts[i], B_verts[j]
-    #             if Bi * Bj < 0:   # sign change on this edge
-    #                 t = Bi / (Bi - Bj)
-    #                 x_star = vertices[i] + t * (vertices[j] - vertices[i])
-    #                 zls_points.append(x_star)
-
-    #     if len(zls_points) == 0:
-    #         continue   # no crossing edges — skip
-
-    #     zls_centroid = np.mean(zls_points, axis=0)
-
-    #     # b_i from ZLS centroid: B(zls_centroid) ≈ 0, so b_i = -p_i · zls_centroid
-    #     # But compute it properly from a vertex to avoid accumulated error
-    #     with torch.no_grad():
-    #         B_zls = float(barrier_model(
-    #             torch.tensor(zls_centroid.astype(np_dtype)[None,:], dtype=model_dtype)
-    #         ).item())
-    #     b_i = B_zls - float(p_i @ zls_centroid)
-
-    #     # Lie derivative: p_i · f(x*) = b_i * (1 + ||x*||²)
-    #     r2  = float(np.sum(zls_centroid**2))
-    #     lie = b_i * (1 + r2)
-
-    #     if lie < 0:
-    #         violations.append((cell_idx, lie, b_i))
-
-    # print(f"  Total boundary cells : {len(BC)}")
-    # print(f"  Cells with lie < 0  : {len(violations)}")
-    # if violations:
-    #     print(f"  First few: {violations[:5]}")
-    #     print(f"  Certificate FALSIFIED algebraically.")
-    # else:
-    #     print(f"  All cells SAFE — Ren et al. falsification is a numerical artifact.")
-    
-    #     # Pick cell 0 and verify manually
-    # # ── Debug: verify algebraic identity on cell 0 ───────────────────────────
-    # model_dtype = next(barrier_model.parameters()).dtype
-    # np_dtype    = np.float64 if model_dtype == torch.float64 else np.float32
-
-    # cell_idx = 0
-    # sv_i     = sv[cell_idx].ravel()
-    # p_i      = compute_local_gradient(sv_i, hyperplanes, W)
-    # centroid = np.asarray(BC[cell_idx], dtype=np.float64).mean(axis=0)
-
-    # with torch.no_grad():
-    #     B_c = float(barrier_model(
-    #         torch.tensor(centroid.astype(np_dtype)[None,:], dtype=model_dtype)
-    #     ).item())
-
-    # b_i = B_c - float(p_i @ centroid)
-
-    # # Project centroid onto ZLS
-    # x_star = centroid - B_c / float(p_i @ p_i) * p_i
-
-    # with torch.no_grad():
-    #     B_xstar = float(barrier_model(
-    #         torch.tensor(x_star.astype(np_dtype)[None,:], dtype=model_dtype)
-    #     ).item())
-
-    # # Decay dynamics: f_i(x) = -x_i * (1 + ||x||^2)
-    # r2      = float(np.sum(x_star**2))
-    # f_xstar = -x_star * (1 + r2)
-
-    # lie_direct    = float(p_i @ f_xstar)
-    # lie_algebraic = b_i * (1 + r2)
-
-    # print(f"\n── Cell 0 algebraic debug ──")
-    # print(f"B(centroid)          = {B_c:.8f}")
-    # print(f"B(x*)                = {B_xstar:.2e}  (should be ≈ 0)")
-    # print(f"b_i                  = {b_i:.8f}")
-    # print(f"p_i · f(x*) direct   = {lie_direct:.8f}")
-    # print(f"p_i · f(x*) algebraic= {lie_algebraic:.8f}")
-    # print(f"match                = {abs(lie_direct - lie_algebraic) < 1e-6}")
-    
-    
-    
-    
     if verification == "barrier" and len(BC) > 0:
         dynamics_name = name_file.split("/")[-1].split("_")[0].lower()
         summary = verify_barrier(
@@ -1032,21 +901,7 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
         )
         from relu_region_enumerator.validate_with_nlp import validate_with_nlp
 
-#         report = validate_with_nlp(
-#             BC, sv, hyperplanes, b, W,bdh,bdb,
-#             barrier_model, dynamics_name=dynamics_name,
-#             summary=summary,        # pass the VerificationSummary from verify_barrier
-#             continuous_time=True,
-#         )
-#         report.print_counterexamples(
-#     max_print    = 5,
-#     BC           = BC,
-#     sv           = sv,
-#     layer_W      = hyperplanes,
-#     W_out        = W,
-#     barrier_model= barrier_model,
-# )
-        # report.print_counterexamples()
+
     if verification == "lyapunov":
         # D_raw = Finding_cell_id(enumerate_poly, hyperplanes, b, num_hidden_layers)
         sv_all = np.hstack([D_raw[l] for l in range(num_hidden_layers)]).T
