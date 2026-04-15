@@ -330,7 +330,7 @@ def _two_step_label(
     x_stars         : np.ndarray,
     barrier_model,
     dyn             : DynamicsEvaluator,
-    hb              : HessianBounder,
+    hb              : Optional[HessianBounder],
     p_i             : np.ndarray,
     cell_idx        : int,
     continuous_time : bool,
@@ -394,7 +394,13 @@ def _two_step_label(
     # Reuse parent cell's M_i when provided — valid because sub-cells are
     # contained in the parent, so the parent bound is still an upper bound.
     # The remainder still shrinks because r decreases with each split.
-    M_i         = M_i_override if M_i_override is not None else hb.bound(p_i, x_stars)
+    # hb=None when dynamics are linear (Hessian identically zero → M_i=0).
+    if M_i_override is not None:
+        M_i = M_i_override
+    elif hb is None:
+        M_i = 0.0
+    else:
+        M_i = hb.bound(p_i, x_stars)
     remainders  = 0.5 * M_i * distances ** 2
     worst_safe  = float((cond_vals + remainders).max())
     best_unsafe = float((cond_vals - remainders).min())
@@ -580,7 +586,7 @@ def _refine_barrier_adaptive(
     p_i             : np.ndarray,
     barrier_model,
     dyn             : DynamicsEvaluator,
-    hb              : HessianBounder,
+    hb              : Optional[HessianBounder],
     cell_idx        : int,
     continuous_time : bool,
     use_wide        : bool,
@@ -768,8 +774,22 @@ def verify_barrier(
            -> INCONCLUSIVE     : max depth reached.
     """
     symbols, f_sym = load_dynamics(dynamics_name)
-    hb             = HessianBounder(symbols, f_sym)
     dyn            = DynamicsEvaluator(symbols, f_sym)
+
+    # Detect linear dynamics: if all second-order partials of f are zero,
+    # the Hessian is identically zero → M_i = 0 always → skip HessianBounder.
+    import sympy as sp
+    _is_linear = all(
+        sp.diff(fi, xj, xk) == 0
+        for fi in f_sym
+        for xj in symbols
+        for xk in symbols
+    )
+    if _is_linear:
+        print("  Linear dynamics detected — skipping HessianBounder (M_i=0 everywhere).")
+        hb = None
+    else:
+        hb = HessianBounder(symbols, f_sym)
     total_neurons  = sum(W.shape[0] for W in layer_W)
     use_wide       = (total_neurons + len(boundary_H) > 64)
     model_dtype    = next(barrier_model.parameters()).dtype
@@ -780,6 +800,7 @@ def verify_barrier(
         TH = list(boundary_b[:n_dim])
 
     summary = VerificationSummary(mode="barrier", dynamics_name=dynamics_name)
+    _eps    = 1e-6
 
     print(f"\nBarrier verification (adaptive refinement): {len(BC)} boundary cells, "
           f"dynamics='{dynamics_name}', "
@@ -797,6 +818,25 @@ def verify_barrier(
             B_vals = barrier_model(
                 torch.tensor(vertices.astype(np_dtype), dtype=model_dtype)
             ).numpy().ravel()
+
+        # ── Fast vertex pre-check for linear dynamics (continuous time only) ──
+        # p_i · f(x) is affine over the cell → extremum is at a vertex.
+        # If all vertices satisfy the condition, the cell is safe everywhere
+        # including on B=0, so the expensive ZLS computation can be skipped.
+        # For violated vertices: they may lie away from B=0, so we still need
+        # the exact ZLS intersection before declaring UNSAFE.
+        if _is_linear and continuous_time:
+            F_verts    = dyn.eval_batch(vertices)
+            cond_verts = F_verts @ p_i
+            if float(cond_verts.max()) <= _eps:
+                summary.results.append(CellResult(
+                    label=Label.SAFE_TAYLOR, cell_idx=i,
+                    M_i=0.0, r_i=0.0, remainder=0.0,
+                    max_condition=float(cond_verts.max()),
+                ))
+                summary.n_safe_taylor += 1
+                continue
+            # else: at least one vertex violates — fall through to ZLS
 
         # Find zero level set crossings and the two ZLS sub-polytopes
         x_stars, x_masks, verts_B_neg, verts_B_pos = _get_zero_level_set_crossings(

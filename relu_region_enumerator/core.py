@@ -43,6 +43,7 @@ from .bitwise_utils import Enumerator_rapid,finding_deep_hype, generate_mask_wid
 from .Dynamics import load_dynamics, list_systems
 from .verify_certificate_new import verify_barrier
 from .verify_certificates import verify_lyapunov
+from .ibp_filter import precompute_ibp_weights, vertex_ibp_filter, warmup_numba
 
 
 
@@ -181,7 +182,8 @@ def Finding_cell_id(enumerate_poly, hyperplanes, bias, num_hidden_layers, batch_
 # ---------------------------------------------------------------------------
 # Barrier certificate verification
 # ---------------------------------------------------------------------------
-def barrier_certificate_cells(model, enumerate_poly, hyperplanes, b, name_file,test_stat=False):
+def barrier_certificate_cells(model, enumerate_poly, hyperplanes, b, name_file,
+                              test_stat=False, pre_filtered=False):
     """Identify linear regions that straddle the zero level set of a barrier certificate.
 
     A region is a boundary cell if b(x) changes sign across its vertices,
@@ -338,10 +340,15 @@ def barrier_certificate_cells(model, enumerate_poly, hyperplanes, b, name_file,t
             poly_arr = np.asarray(poly, dtype=np.float64)
             n_dim    = poly_arr.shape[1]
 
-            # Boundary detection — single forward pass over all vertices.
-            P_k = model(torch.tensor(poly_arr, dtype=model_dtype))
+            # Boundary detection — skipped when pre_filtered=True because the
+            # vertex_ibp_filter already guaranteed every cell straddles B=0.
+            if not pre_filtered:
+                P_k = model(torch.tensor(poly_arr, dtype=model_dtype))
+                is_boundary = P_k.min().item() < 1e-5 and P_k.max().item() > 1e-5
+            else:
+                is_boundary = True
 
-            if P_k.min().item() < 1e-5 and P_k.max().item() > 1e-5:
+            if is_boundary:
                 val["boundary_cells"] += 1
 
                 # Compute activation pattern from centroid.
@@ -449,7 +456,8 @@ def barrier_certificate_cells(model, enumerate_poly, hyperplanes, b, name_file,t
 # ---------------------------------------------------------------------------
 
 def enumeration_function(NN_file, name_file, TH, mode, parallel,
-                         verification=None, barrier_model=None):
+                         verification=None, barrier_model=None,
+                         ibp_filter=True):
     """Enumerate all polytopic linear regions of a ReLU network over a hypercube.
 
     The function loads a TorchScript-saved ReLU network, extracts its weight
@@ -567,7 +575,29 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
 
     WRITE_BUFFER_SIZE = 5000   # Polytopes buffered before a single HDF5 flush.
 
+    # Precompute IBP weights once (barrier network = enumeration network).
+    _run_ibp = (ibp_filter and verification == "barrier" and barrier_model is not None)
+    if _run_ibp:
+        W_ibp_full = list(hyperplanes) + [W]
+        b_ibp_full = [bi.ravel() for bi in b] + [c.ravel()]
+        W_pos_ibp, W_neg_ibp, b_arr_ibp = precompute_ibp_weights(
+            W_ibp_full, b_ibp_full
+        )
+        warmup_numba(n_in=n, m_hidden=hyperplanes[0].shape[0],
+                     n_layers=len(W_ibp_full))
+
     st_enum = time.time()
+
+    # ── Disk-streaming state ──────────────────────────────────────────────────
+    # For the use_disk path, instead of loading all cells into RAM between
+    # layers, we keep a pointer to the HDF5 file that holds the current layer's
+    # input cells.  The j-loop reads one cell at a time from this file.
+    # At i==0 there is only one input cell (the hypercube), so no HDF5 needed.
+    _in_h5_path    = None   # path to input HDF5 for current layer (None → RAM)
+    _in_offsets    = None   # list of vertex-row offsets inside that file
+    _in_N          = 1      # number of input cells (starts at 1: the hypercube)
+
+    FILTER_BATCH   = 5_000  # cells per IBP-filter batch (controls peak RAM)
 
     for i in range(num_hidden_layers):
 
@@ -579,17 +609,27 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
                 "vertices", shape=(0, n), maxshape=(None, n),
                 dtype=np.float64, chunks=(512, n),
             )
-            offsets      = [0]
-            write_buffer = []
+            offsets              = [0]
+            write_buffer         = []
             write_buffer_offsets = []
 
-        for j in range(len(enumerate_poly)):
+            # Open the input file for this layer (i >= 1 only; i==0 uses RAM).
+            if _in_h5_path is not None:
+                _h5f_in  = h5py.File(_in_h5_path, "r")
+                _ds_in   = _h5f_in["vertices"]
+                _offs_in = np.array(_in_offsets)
+            else:
+                _h5f_in = None
+
+        N_j = _in_N if (use_disk and _in_h5_path is not None) else len(enumerate_poly)
+
+        for j in range(N_j):
             if j % 1000 == 0:
-                print(f"  Layer {i}: processing cell {j} / {len(enumerate_poly)}")
+                print(f"  Layer {i}: processing cell {j} / {N_j}")
 
             if i == 0:
                 # First layer: all polytopes share the same input domain.
-                enumerate_poly_n= Enumerator_rapid(
+                enumerate_poly_n = Enumerator_rapid(
                     hyperplanes[i], b[i],
                     original_polytope_test, TH,
                     [border_hyperplane], [border_bias],
@@ -597,25 +637,28 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
                     use_wide=use_wide,
                 )
             else:
-                # Deeper layers: propagate accumulated boundary hyperplanes
-                # for the current cell through the previous layers.
+                # Deeper layers: read cell j from HDF5 (disk path) or RAM.
+                if use_disk and _h5f_in is not None:
+                    cell_j = _ds_in[_offs_in[j]:_offs_in[j + 1]][:]
+                else:
+                    cell_j = enumerate_poly[j]
+
                 hype1, bias1, border_hyperplane1, border_bias1 = finding_deep_hype(
                     hyperplanes, b,
-                    enumerate_poly[j],
+                    cell_j,
                     border_hyperplane, border_bias,
                     i, n,
                 )
-                enumerate_poly_n= Enumerator_rapid(
+                enumerate_poly_n = Enumerator_rapid(
                     hype1, bias1,
-                    np.array([enumerate_poly[j]]), TH,
+                    np.array([cell_j]), TH,
                     [border_hyperplane1], [border_bias1],
-                    parallel, np.array([1] * n_h), i,
+                    False,  # serial: single polytope → parallel overhead > benefit
+                    np.array([1] * n_h), i,
                     use_wide=use_wide,
                 )
 
             if use_disk:
-                # Buffer results and flush to HDF5 in batches to reduce
-                # the number of resize calls.
                 for poly in enumerate_poly_n:
                     poly_arr = np.array(poly, dtype=np.float64)
                     write_buffer.append(poly_arr)
@@ -637,36 +680,140 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
                 del enumerate_poly_n
 
         # ------------------------------------------------------------------
-        # End of layer: finalise output and reload for the next iteration.
+        # End of layer: finalise output, apply IBP filter, update disk state.
         # ------------------------------------------------------------------
+        _is_last = _run_ibp and (i == num_hidden_layers - 1)
+
         if use_disk:
-            # Flush any remaining buffered polytopes.
+            # Close the input HDF5 (no longer needed) and delete it.
+            if _h5f_in is not None:
+                _h5f_in.close()
+                _h5f_in = None
+            if _in_h5_path is not None and os.path.exists(_in_h5_path):
+                os.remove(_in_h5_path)
+                _in_h5_path = None
+
+            # Flush any remaining buffered output polytopes.
             if write_buffer:
                 batch = np.vstack(write_buffer)
                 ds.resize(ds.shape[0] + len(batch), axis=0)
                 ds[-len(batch):] = batch
                 for sz in write_buffer_offsets:
                     offsets.append(offsets[-1] + sz)
-
             h5f.close()
             del enumerate_poly
             gc.collect()
 
-            # Read the HDF5 file back as a Python list of vertex arrays.
-            with h5py.File(h5_path, "r") as h5f_r:
-                ds_r        = h5f_r["vertices"]
-                offsets_arr = np.array(offsets)
-                enumerate_poly = [
-                    ds_r[offsets_arr[k]:offsets_arr[k + 1]][:]
-                    for k in range(len(offsets_arr) - 1)
-                ]
-            os.remove(h5_path)
-            print(f"  Layer {i} complete: {len(enumerate_poly)} regions.")
+            offsets_arr = np.array(offsets)
+            N_layer     = len(offsets_arr) - 1
+            print(f"  Layer {i} complete: {N_layer} regions.")
+
+            if _run_ibp:
+                # ── Streaming IBP filter → write survivors to filtered_i.h5 ──
+                # Reads layer_i.h5 in FILTER_BATCH-sized chunks; each batch is
+                # filtered and its survivors are immediately written to the new
+                # HDF5 file.  Peak RAM ≈ FILTER_BATCH × avg_verts × n × 8 B.
+                filtered_h5_path    = os.path.join(tmp_dir, f"filtered_{i}.h5")
+                filtered_offsets    = [0]
+                n_kept_total        = 0
+                t0_f                = time.time()
+
+                with h5py.File(h5_path, "r") as h5f_r, \
+                     h5py.File(filtered_h5_path, "w") as h5f_w:
+                    ds_r  = h5f_r["vertices"]
+                    ds_w  = h5f_w.create_dataset(
+                        "vertices", shape=(0, n), maxshape=(None, n),
+                        dtype=np.float64, chunks=(512, n),
+                    )
+                    fbuf      = []
+                    fbuf_szs  = []
+
+                    for b_start in range(0, N_layer, FILTER_BATCH):
+                        b_end       = min(b_start + FILTER_BATCH, N_layer)
+                        batch_cells = [
+                            ds_r[offsets_arr[k]:offsets_arr[k + 1]][:]
+                            for k in range(b_start, b_end)
+                        ]
+                        filtered_batch, _ = vertex_ibp_filter(
+                            batch_cells,
+                            W_pos_ibp, W_neg_ibp, b_arr_ibp,
+                            is_last_layer=_is_last,
+                            n_known=i + 1,
+                            verbose=False,
+                        )
+                        for cell in filtered_batch:
+                            fbuf.append(cell)
+                            fbuf_szs.append(len(cell))
+                            n_kept_total += 1
+                            if len(fbuf) >= WRITE_BUFFER_SIZE:
+                                blk = np.vstack(fbuf)
+                                ds_w.resize(ds_w.shape[0] + len(blk), axis=0)
+                                ds_w[-len(blk):] = blk
+                                for sz in fbuf_szs:
+                                    filtered_offsets.append(filtered_offsets[-1] + sz)
+                                fbuf     = []
+                                fbuf_szs = []
+                        del batch_cells, filtered_batch
+
+                    # Flush remainder.
+                    if fbuf:
+                        blk = np.vstack(fbuf)
+                        ds_w.resize(ds_w.shape[0] + len(blk), axis=0)
+                        ds_w[-len(blk):] = blk
+                        for sz in fbuf_szs:
+                            filtered_offsets.append(filtered_offsets[-1] + sz)
+
+                os.remove(h5_path)
+                n_pruned = N_layer - n_kept_total
+                print(f"  [Filter] Layer {i}: {N_layer} → {n_kept_total} "
+                      f"({n_pruned} pruned, {100.0*n_pruned/N_layer:.1f}%) "
+                      f"in {time.time()-t0_f:.3f}s")
+                if _is_last:
+                    print(f"  [Filter] Layer {i} (last): vertex check exact.")
+
+                # Point the next layer's input at the filtered HDF5.
+                _in_h5_path = filtered_h5_path
+                _in_offsets = filtered_offsets
+                _in_N       = n_kept_total
+
+            else:
+                # No filter: the raw layer output becomes the next input.
+                _in_h5_path = h5_path        # keep the file; do NOT delete yet
+                _in_offsets = list(offsets)
+                _in_N       = N_layer
+
+            # enumerate_poly is no longer used in the disk path after i==0;
+            # set it to a tiny sentinel so the first-layer branch still works.
+            enumerate_poly = []
+
         else:
             del enumerate_poly
             gc.collect()
             enumerate_poly = enumerate_poly_n_list
             del enumerate_poly_n_list
+
+            # ── In-memory IBP filter (low-dim path, n <= 5) ───────────────
+            if _run_ibp:
+                cells_before = enumerate_poly
+                t0_f = time.time()
+                enumerate_poly, _ = vertex_ibp_filter(
+                    cells_before,
+                    W_pos_ibp, W_neg_ibp, b_arr_ibp,
+                    is_last_layer=_is_last,
+                    n_known=i + 1,
+                    verbose=True,
+                )
+                n_before = len(cells_before)
+                n_pruned = n_before - len(enumerate_poly)
+                print(f"  [Filter] Layer {i}: {n_before} → {len(enumerate_poly)} "
+                      f"({n_pruned} pruned) in {time.time()-t0_f:.3f}s")
+                if _is_last:
+                    print(f"  [Filter] Layer {i} (last): vertex check exact.")
+                del cells_before
+
+    # Clean up any leftover input HDF5 from the last layer.
+    if use_disk and _in_h5_path is not None and os.path.exists(_in_h5_path):
+        os.remove(_in_h5_path)
     
     
     
@@ -684,7 +831,8 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
             print("Warning: verification='barrier' requires barrier_model. Skipping.")
         else:
             sv,BC,_=barrier_certificate_cells(
-                barrier_model, enumerate_poly, hyperplanes, b, name_file
+                barrier_model, enumerate_poly, hyperplanes, b, name_file,
+                pre_filtered=_run_ibp,
             )
     else:
         # Default: compute D for all enumerated regions.
@@ -884,20 +1032,20 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
         )
         from relu_region_enumerator.validate_with_nlp import validate_with_nlp
 
-        report = validate_with_nlp(
-            BC, sv, hyperplanes, b, W,bdh,bdb,
-            barrier_model, dynamics_name=dynamics_name,
-            summary=summary,        # pass the VerificationSummary from verify_barrier
-            continuous_time=True,
-        )
-        report.print_counterexamples(
-    max_print    = 5,
-    BC           = BC,
-    sv           = sv,
-    layer_W      = hyperplanes,
-    W_out        = W,
-    barrier_model= barrier_model,
-)
+#         report = validate_with_nlp(
+#             BC, sv, hyperplanes, b, W,bdh,bdb,
+#             barrier_model, dynamics_name=dynamics_name,
+#             summary=summary,        # pass the VerificationSummary from verify_barrier
+#             continuous_time=True,
+#         )
+#         report.print_counterexamples(
+#     max_print    = 5,
+#     BC           = BC,
+#     sv           = sv,
+#     layer_W      = hyperplanes,
+#     W_out        = W,
+#     barrier_model= barrier_model,
+# )
         # report.print_counterexamples()
     if verification == "lyapunov":
         # D_raw = Finding_cell_id(enumerate_poly, hyperplanes, b, num_hidden_layers)

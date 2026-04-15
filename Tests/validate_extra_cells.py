@@ -50,7 +50,7 @@ class BarrierNet(nn.Module):
 # ─────────────────────────────────────────────
 # 2. Model loading
 # ─────────────────────────────────────────────
-def load_model(model_path, input_dim=3, hidden_dim=64):
+def load_model(model_path, input_dim=8, hidden_dim=16):
     print(f"Loading model from {model_path}...")
 
     # Try TorchScript first
@@ -236,13 +236,34 @@ def ren_to_tuple(pattern):
 def our_to_tuple(cell):
     return tuple(int(round(v)) for v in cell)
 
+def tuple_to_layers(t, neurons_per_layer):
+    """Split a flat activation tuple into per-layer lists."""
+    layers = []
+    idx = 0
+    for n in neurons_per_layer:
+        layers.append(list(t[idx:idx + n]))
+        idx += n
+    return layers
+
+def print_pattern(t, neurons_per_layer, label=""):
+    """Print an activation pattern layer-by-layer as a compact bit string."""
+    layers = tuple_to_layers(t, neurons_per_layer)
+    n_active_total = sum(t)
+    layer_strs = []
+    for i, layer in enumerate(layers):
+        bits = ''.join(str(v) for v in layer)
+        n_act = sum(layer)
+        layer_strs.append(f"L{i+1}[{n_act:2d}/{len(layer)}]:{bits}")
+    prefix = f"{label:30s}" if label else ""
+    print(f"  {prefix}  " + "  |  ".join(layer_strs) + f"  (total active: {n_active_total}/{len(t)})")
+
 # ─────────────────────────────────────────────
 # 8. Main
 # ─────────────────────────────────────────────
-def main(h5_path, npy_path, model_path, input_dim=3, domain=3.0):
+def main(h5_path, npy_path, model_path, input_dim=8, domain=3.0):
 
-    model    = load_model(model_path, input_dim=input_dim, hidden_dim=64)
-    W, b     = extract_weights(model)
+    # model    = load_model(model_path, input_dim=input_dim, hidden_dim=64)
+    # W, b     = extract_weights(model)
 
     our_raw  = load_our_cells(h5_path)
     ren_raw  = load_ren_cells(npy_path)
@@ -251,13 +272,47 @@ def main(h5_path, npy_path, model_path, input_dim=3, domain=3.0):
     ren_set  = set(ren_to_tuple(p) for p in ren_raw)
 
     only_ours = our_set - ren_set
-    print(f"\nCells only in ours: {len(only_ours)}")
+    only_ren  = ren_set - our_set
+    both      = our_set & ren_set
+
+    print(f"\n{'='*60}")
+    print(f"Set comparison:")
+    print(f"  Ours only  (we found, Ren missed): {len(only_ours):5d}")
+    print(f"  Ren only   (Ren found, we missed): {len(only_ren):5d}")
+    print(f"  In common:                         {len(both):5d}")
+    print(f"{'='*60}")
+
+    # ── Infer neurons-per-layer from the pattern length ──────────────────
+    sample = next(iter(our_set | ren_set))
+    total_neurons = len(sample)
+    # Assume equal-width hidden layers; fall back to single block if unclear
+    for n_layers in range(4, 0, -1):
+        if total_neurons % n_layers == 0:
+            neurons_per_layer = [total_neurons // n_layers] * n_layers
+            break
+
+    # ── Show patterns Ren found that we missed ───────────────────────────
+    if only_ren:
+        print(f"\nPatterns in Ren et al. NOT found by our method ({len(only_ren)} cells):")
+        print(f"(neurons per layer: {neurons_per_layer})\n")
+        for i, t in enumerate(sorted(only_ren)):
+            print_pattern(t, neurons_per_layer, label=f"missing #{i+1:4d}")
+        # Summary: active-neuron count distribution per layer
+        print(f"\nActive-neuron count distribution for MISSING patterns:")
+        for li, n in enumerate(neurons_per_layer):
+            offset = sum(neurons_per_layer[:li])
+            counts = np.array([sum(t[offset:offset+n]) for t in only_ren])
+            print(f"  Layer {li+1}: mean={counts.mean():.1f}  "
+                  f"min={counts.min()}  max={counts.max()}  "
+                  f"hist={np.bincount(counts, minlength=n+1).tolist()}")
+    else:
+        print("\nOur method found ALL of Ren's patterns — no missing cells.")
 
     if not only_ours:
-        print("No extra cells to validate.")
+        print("\nNo extra cells to validate (ours ⊆ Ren).")
         return
 
-    print(f"Running two-question LP validation on {len(only_ours)} extra cells...\n")
+    print(f"\nRunning two-question LP validation on {len(only_ours)} extra cells (in ours, not Ren)...\n")
 
     counts = {'BOUNDARY_CELL': 0, 'NOT_BOUNDARY': 0, 'EMPTY_REGION': 0, 'ERROR': 0}
 
@@ -296,9 +351,9 @@ def main(h5_path, npy_path, model_path, input_dim=3, domain=3.0):
         print(f"\n[CONCLUSION] {counts['EMPTY_REGION']} truly spurious cells found — investigate enumeration.")
 
 if __name__ == "__main__":
-    h5_path    = sys.argv[1] if len(sys.argv) > 1 else "complex_boundary_cells.h5"
-    npy_path   = sys.argv[2] if len(sys.argv) > 2 else "verification_patterns.npy"
-    model_path = sys.argv[3] if len(sys.argv) > 3 else "NN_files/complex_3d_2x64.pt"
+    h5_path    = sys.argv[1] if len(sys.argv) > 1 else "hiord8_boundary_cells.h5"
+    npy_path   = sys.argv[2] if len(sys.argv) > 2 else "boundary_list_new.npy"
+    model_path = sys.argv[3] if len(sys.argv) > 3 else "NN_files/high_o_commit_2fd0d11_layers_4_size_16_seed_222_certify_True.pt"
     input_dim  = int(sys.argv[4])   if len(sys.argv) > 4 else 3
     domain     = float(sys.argv[5]) if len(sys.argv) > 5 else 3.0
     main(h5_path, npy_path, model_path, input_dim, domain)

@@ -14,12 +14,12 @@ if __name__=='__main__':
         # NN_file="NN_files/model_6d_20_20_deep.pt"
         # NN_file="NN_files/model_quadrotor_modified.pt"
         # NN_file="NN_files/model_6d_dee.pt"
-        NN_file="NN_files/complex_3d_2x64.pt"
+        NN_file="NN_files/high_o_2x16_ren.pt"
         eps1=0.001
         eps2=0.01
-        name="complex"
-        TH=TH = [2.0]*3
-        barrier_model = torch.jit.load("NN_files/complex_3d_2x64.pt", map_location="cpu")
+        name="hiord8"
+        TH=TH = [2.0]*8
+        barrier_model = torch.jit.load("NN_files/high_o_2x16_ren.pt", map_location="cpu")
         barrier_model.eval()
         enumeration_function(NN_file,name,TH,mode,parallel,verification='barrier',barrier_model=barrier_model)
     stats=pstats.Stats(pr)

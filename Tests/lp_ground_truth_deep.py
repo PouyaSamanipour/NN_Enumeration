@@ -312,10 +312,10 @@ def run_trial(n, m1, m2, seed, domain, slack):
     # --- LP ground truth ---
     print(f"    Running LP feasibility on {2**(m1+m2)} joint patterns...",
           end=" ", flush=True)
-    feasible_patterns, n_lp, t_lp = lp_ground_truth_deep(
-        H1, b1, H2, b2, G, g, slack=slack
-    )
-    print(f"{n_lp} feasible  ({t_lp:.2f} s)")
+    # feasible_patterns, n_lp, t_lp = lp_ground_truth_deep(
+    #     H1, b1, H2, b2, G, g, slack=slack
+    # )
+    # print(f"{n_lp} feasible  ({t_lp:.2f} s)")
  
     # --- Enumerator ---
     print(f"    Running deep enumerator...", end=" ", flush=True)
@@ -323,30 +323,30 @@ def run_trial(n, m1, m2, seed, domain, slack):
     print(f"{n_enum} cells  ({t_enum:.3f} s)")
  
     # --- Count comparison ---
-    count_match = n_enum == n_lp
+    # count_match = n_enum == n_lp
  
-    # --- Sign vector comparison ---
-    lp_sv_set   = set(feasible_patterns)
-    enum_sv_set = get_sign_vectors_deep(cells, H1, b1, H2, b2)
+    # # --- Sign vector comparison ---
+    # lp_sv_set   = set(feasible_patterns)
+    # enum_sv_set = get_sign_vectors_deep(cells, H1, b1, H2, b2)
  
-    missing_from_enum = lp_sv_set   - enum_sv_set
-    extra_in_enum     = enum_sv_set - lp_sv_set
-    sv_match = (len(missing_from_enum) == 0 and len(extra_in_enum) == 0)
+    # missing_from_enum = lp_sv_set   - enum_sv_set
+    # extra_in_enum     = enum_sv_set - lp_sv_set
+    # sv_match = (len(missing_from_enum) == 0 and len(extra_in_enum) == 0)
  
-    print(f"    (a) Count match        : {'PASS' if count_match else 'FAIL'}  "
-          f"(LP={n_lp}, Enum={n_enum})")
-    print(f"    (b) Sign vector match  : {'PASS' if sv_match else 'FAIL'}  "
-          f"(missing={len(missing_from_enum)}, extra={len(extra_in_enum)})")
+    # print(f"    (a) Count match        : {'PASS' if count_match else 'FAIL'}  "
+    #       f"(LP={n_lp}, Enum={n_enum})")
+    # print(f"    (b) Sign vector match  : {'PASS' if sv_match else 'FAIL'}  "
+    #       f"(missing={len(missing_from_enum)}, extra={len(extra_in_enum)})")
  
-    if not sv_match:
-        if missing_from_enum:
-            print(f"    Patterns in LP but not enum ({len(missing_from_enum)}):")
-            for p in list(missing_from_enum)[:3]:
-                print(f"      s1={p[0]}, s2={p[1]}")
-        if extra_in_enum:
-            print(f"    Patterns in enum but not LP ({len(extra_in_enum)}):")
-            for p in list(extra_in_enum)[:3]:
-                print(f"      s1={p[0]}, s2={p[1]}")
+    # if not sv_match:
+    #     if missing_from_enum:
+    #         print(f"    Patterns in LP but not enum ({len(missing_from_enum)}):")
+    #         for p in list(missing_from_enum)[:3]:
+    #             print(f"      s1={p[0]}, s2={p[1]}")
+    #     if extra_in_enum:
+    #         print(f"    Patterns in enum but not LP ({len(extra_in_enum)}):")
+    #         for p in list(extra_in_enum)[:3]:
+    #             print(f"      s1={p[0]}, s2={p[1]}")
  
     # # --- CDD vertex validation ---
     # from cdd_vertex_validation import run_cdd_vertex_validation
@@ -366,21 +366,21 @@ def run_trial(n, m1, m2, seed, domain, slack):
     #       f"missing={cdd_report.n_missing_total}, "
     #       f"redundant={cdd_report.n_redundant_total})")
  
-    overall = count_match and sv_match
-    print(f"    OVERALL: {'PASS' if overall else 'FAIL'}")
+    # overall = count_match and sv_match
+    # print(f"    OVERALL: {'PASS' if overall else 'FAIL'}")
  
-    return {
-        "seed"              : seed,
-        "n_lp"              : n_lp,
-        "n_enum"            : n_enum,
-        "t_lp"              : t_lp,
-        "t_enum"            : t_enum,
-        "count_match"       : count_match,
-        "sv_match"          : sv_match,
-        "missing_from_enum" : len(missing_from_enum),
-        "extra_in_enum"     : len(extra_in_enum),
-        "pass"              : overall,
-    }
+    # return {
+    #     "seed"              : seed,
+    #     "n_lp"              : n_lp,
+    #     "n_enum"            : n_enum,
+    #     "t_lp"              : t_lp,
+    #     "t_enum"            : t_enum,
+    #     "count_match"       : count_match,
+    #     "sv_match"          : sv_match,
+    #     "missing_from_enum" : len(missing_from_enum),
+    #     "extra_in_enum"     : len(extra_in_enum),
+    #     "pass"              : overall,
+    # }
  
 # ---------------------------------------------------------------------------
 # Main

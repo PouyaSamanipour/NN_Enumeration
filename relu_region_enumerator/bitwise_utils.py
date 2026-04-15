@@ -799,50 +799,36 @@ def _wide_mask_or_and(shared_u, mask_u, bit_index, num_words):
  
  
 @njit
-def slice_polytope_wide(enumerate_poly, hyperplane_val, masks_w, i, n):
-    """Slice a polytope using wide (multi-word) bitmask adjacency.
- 
-    Mirrors the logic of :func:`slice_polytope_with_hyperplane` exactly,
-    but operates on (V, num_words) mask arrays instead of scalar uint64.
- 
-    Parameters
-    ----------
-    enumerate_poly : (V, n) float64 array
-    hyperplane_val : (V,)   float64 array
-    masks_w        : (V, num_words) uint64 array
-    i              : int -- global bit index of the current hyperplane
-    n              : int -- input dimension
- 
-    Returns
-    -------
-    polytopes     : list of two (V_k, n) arrays -- [inside, outside]
-    mask_lists    : list of two (V_k, num_words) arrays
-    created_verts : (E, n) float64 array
+def _slice_polytope_wide_seq(enumerate_poly, hyperplane_val, masks_w, i, n):
+    """Sequential (single-threaded) wide-mask polytope slicer.
+
+    Called by :func:`slice_polytope_wide` for small polytopes where thread
+    overhead would outweigh the parallelism benefit.
     """
     num_words  = masks_w.shape[1]
     req_shared = n - 1
- 
+
     strict_index_in  = np.where(hyperplane_val < -1e-9)[0]
     strict_index_out = np.where(hyperplane_val >  1e-9)[0]
     index_in  = np.where(hyperplane_val <= 1e-5)[0]
     index_out = np.where(hyperplane_val >= -1e-5)[0]
- 
+
     max_new = len(index_in) * len(index_out)
     new_verts_buffer = np.zeros((max_new, n),         dtype=np.float64)
     new_masks_buffer = np.zeros((max_new, num_words),  dtype=np.uint64)
     count = 0
- 
+
     for k in range(len(strict_index_in)):
         u_idx  = strict_index_in[k]
         mask_u = masks_w[u_idx]
- 
+
         for l in range(len(strict_index_out)):
             v_idx = strict_index_out[l]
- 
+
             if hyperplane_val[u_idx] < -1e-9 and hyperplane_val[v_idx] > 1e-9:
                 mask_v      = masks_w[v_idx]
                 shared_mask = mask_u & mask_v   # element-wise, shape (num_words,)
- 
+
                 if _wide_popcount_ge(mask_u, mask_v, req_shared, num_words):
                     d1 = hyperplane_val[u_idx]
                     d2 = hyperplane_val[v_idx]
@@ -854,31 +840,161 @@ def slice_polytope_wide(enumerate_poly, hyperplane_val, masks_w, i, n):
                         shared_mask, mask_u, i, num_words
                     )
                     count += 1
- 
+
     created_verts = new_verts_buffer[:count]
     created_masks = new_masks_buffer[:count]
- 
-    # Manual concatenation: Numba supports pre-allocated copy but not np.vstack
-    # on 2D arrays of different row counts in all versions, so we do it explicitly.
+
     n_in  = len(index_in)
     n_out = len(index_out)
- 
+
     verts_in  = np.empty((n_in  + count, n),         dtype=np.float64)
     masks_in  = np.empty((n_in  + count, num_words),  dtype=np.uint64)
     verts_out = np.empty((n_out + count, n),         dtype=np.float64)
     masks_out = np.empty((n_out + count, num_words),  dtype=np.uint64)
- 
+
     verts_in[:n_in]   = enumerate_poly[index_in]
     masks_in[:n_in]   = masks_w[index_in]
     verts_in[n_in:]   = created_verts
     masks_in[n_in:]   = created_masks
- 
+
     verts_out[:n_out] = enumerate_poly[index_out]
     masks_out[:n_out] = masks_w[index_out]
     verts_out[n_out:] = created_verts
     masks_out[n_out:] = created_masks
- 
+
     return [verts_in, verts_out], [masks_in, masks_out], created_verts
+
+
+@njit
+def _compact_wide(verts_buf, masks_buf, valid, n, num_words):
+    """Compact pre-allocated buffers: keep only rows where valid[idx] is True."""
+    count = 0
+    for idx in range(len(valid)):
+        if valid[idx]:
+            count += 1
+    out_v = np.empty((count, n),          dtype=np.float64)
+    out_m = np.empty((count, num_words),   dtype=np.uint64)
+    j = 0
+    for idx in range(len(valid)):
+        if valid[idx]:
+            out_v[j] = verts_buf[idx]
+            out_m[j] = masks_buf[idx]
+            j += 1
+    return out_v, out_m
+
+
+import numba as nb
+
+@njit(parallel=True)
+def _slice_polytope_wide_par(enumerate_poly, hyperplane_val, masks_w, i, n):
+    """Parallel wide-mask slicer using prange on the outer (u) loop.
+
+    Each (k, l) pair writes to a pre-determined slot k*n_out+l so there is
+    no data race.  A sequential compaction pass follows to remove empty slots.
+    Called by :func:`slice_polytope_wide` for large polytopes.
+    """
+    num_words  = masks_w.shape[1]
+    req_shared = n - 1
+
+    strict_index_in  = np.where(hyperplane_val < -1e-9)[0]
+    strict_index_out = np.where(hyperplane_val >  1e-9)[0]
+    index_in  = np.where(hyperplane_val <= 1e-5)[0]
+    index_out = np.where(hyperplane_val >= -1e-5)[0]
+
+    n_in_s  = len(strict_index_in)
+    n_out_s = len(strict_index_out)
+    max_new = n_in_s * n_out_s
+
+    new_verts_buffer = np.zeros((max_new, n),          dtype=np.float64)
+    new_masks_buffer = np.zeros((max_new, num_words),   dtype=np.uint64)
+    valid            = np.zeros(max_new,                dtype=nb.boolean)
+
+    for k in prange(n_in_s):                   # parallel over u-vertices
+        u_idx  = strict_index_in[k]
+        mask_u = masks_w[u_idx]
+        d1     = hyperplane_val[u_idx]
+
+        for l in range(n_out_s):               # serial over v-vertices per thread
+            v_idx    = strict_index_out[l]
+            flat_idx = k * n_out_s + l
+
+            if d1 < -1e-9 and hyperplane_val[v_idx] > 1e-9:
+                mask_v = masks_w[v_idx]
+                if _wide_popcount_ge(mask_u, mask_v, req_shared, num_words):
+                    d2 = hyperplane_val[v_idx]
+                    t  = -d1 / (d2 - d1)
+                    for dim in range(n):
+                        new_verts_buffer[flat_idx, dim] = (
+                            enumerate_poly[u_idx, dim]
+                            + t * (enumerate_poly[v_idx, dim]
+                                   - enumerate_poly[u_idx, dim])
+                        )
+                    new_masks_buffer[flat_idx] = _wide_mask_or_and(
+                        mask_u & mask_v, mask_u, i, num_words
+                    )
+                    valid[flat_idx] = True
+
+    created_verts, created_masks = _compact_wide(
+        new_verts_buffer, new_masks_buffer, valid, n, num_words
+    )
+
+    n_in  = len(index_in)
+    n_out = len(index_out)
+    count = len(created_verts)
+
+    verts_in  = np.empty((n_in  + count, n),          dtype=np.float64)
+    masks_in  = np.empty((n_in  + count, num_words),   dtype=np.uint64)
+    verts_out = np.empty((n_out + count, n),           dtype=np.float64)
+    masks_out = np.empty((n_out + count, num_words),   dtype=np.uint64)
+
+    verts_in[:n_in]   = enumerate_poly[index_in]
+    masks_in[:n_in]   = masks_w[index_in]
+    verts_in[n_in:]   = created_verts
+    masks_in[n_in:]   = created_masks
+
+    verts_out[:n_out] = enumerate_poly[index_out]
+    masks_out[:n_out] = masks_w[index_out]
+    verts_out[n_out:] = created_verts
+    masks_out[n_out:] = created_masks
+
+    return [verts_in, verts_out], [masks_in, masks_out], created_verts
+
+
+# Threshold: use parallel version when the double-loop work exceeds this many
+# iterations.  Below this, thread-spawn overhead dominates.
+_PAR_THRESHOLD = 10_000
+
+
+def slice_polytope_wide(enumerate_poly, hyperplane_val, masks_w, i, n):
+    """Slice a polytope using wide (multi-word) bitmask adjacency.
+
+    Mirrors the logic of :func:`slice_polytope_with_hyperplane` exactly,
+    but operates on (V, num_words) mask arrays instead of scalar uint64.
+
+    Dispatches to a parallel implementation (prange over u-vertices) when
+    ``n_in * n_out > _PAR_THRESHOLD`` (≈ V > 200 with a 50/50 split), and
+    falls back to the sequential version for small polytopes where thread
+    overhead would dominate.
+
+    Parameters
+    ----------
+    enumerate_poly : (V, n) float64 array
+    hyperplane_val : (V,)   float64 array
+    masks_w        : (V, num_words) uint64 array
+    i              : int -- global bit index of the current hyperplane
+    n              : int -- input dimension
+
+    Returns
+    -------
+    polytopes     : list of two (V_k, n) arrays -- [inside, outside]
+    mask_lists    : list of two (V_k, num_words) arrays
+    created_verts : (E, n) float64 array
+    """
+    n_in_s  = int(np.sum(hyperplane_val < -1e-9))
+    n_out_s = int(np.sum(hyperplane_val >  1e-9))
+    if n_in_s * n_out_s > _PAR_THRESHOLD:
+        return _slice_polytope_wide_par(enumerate_poly, hyperplane_val, masks_w, i, n)
+    return _slice_polytope_wide_seq(enumerate_poly, hyperplane_val, masks_w, i, n)
 
 # ---------------------------------------------------------------------------
 # Storage helpers

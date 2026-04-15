@@ -186,6 +186,56 @@ def get_dynamics_decay():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Hi-Ord8  (8D linear, companion form)
+# ═══════════════════════════════════════════════════════════════════════════
+def get_dynamics_hiord8():
+    """
+    8th-order linear ODE in companion (state-space) form.
+    Reference: SEEV benchmark (hi-ord8).
+
+    Scalar ODE:
+        x^(8) + 20x^(7) + 170x^(6) + 800x^(5) + 2273x^(4)
+              + 3980x^(3) + 4180x^(2) + 2400x^(1) + 576x = 0
+
+    State: [x1, x2, ..., x8] = [x, x^(1), ..., x^(7)]
+
+    Dynamics:
+        x1_dot = x2
+        x2_dot = x3
+        x3_dot = x4
+        x4_dot = x5
+        x5_dot = x6
+        x6_dot = x7
+        x7_dot = x8
+        x8_dot = -576*x1 - 2400*x2 - 4180*x3 - 3980*x4
+                 - 2273*x5 - 800*x6 - 170*x7 - 20*x8
+
+    Domain:  x1^2 + ... + x8^2 <= 4  (sphere radius 2)
+    Initial: (x1-1)^2 + ... + (x8-1)^2 <= 1
+    Safe:    (x1+2)^2 + ... + (x8+2)^2 >= 3
+
+    Note: the dynamics are linear so the Hessian is identically zero —
+    the Taylor remainder bound is always 0 and every cell is decided by
+    the exact check alone (no refinement needed).
+    """
+    syms = sp.symbols('x1:9')   # x1, ..., x8
+    x1, x2, x3, x4, x5, x6, x7, x8 = syms
+
+    f = [
+        x2,
+        x3,
+        x4,
+        x5,
+        x6,
+        x7,
+        x8,
+        -576*x1 - 2400*x2 - 4180*x3 - 3980*x4
+        - 2273*x5 - 800*x6 - 170*x7 - 20*x8,
+    ]
+    return syms, f
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Registry
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -194,6 +244,7 @@ _REGISTRY = {
     "complex"   : get_dynamics_complex,
     "quadrotor" : get_dynamics_quadrotor,
     "decay"     : get_dynamics_decay,
+    "hiord8"    : get_dynamics_hiord8,
 }
 
 
