@@ -573,6 +573,7 @@ def Enumerator_rapid(
                     result = list(polytops_test)
                 else:
                     result = [enumerate_poly[j]]
+                    print(f"Warning: Slicer returned fewer than (n-1) intersection points; "                          f"this may lead to incorrect enumeration results for this hyperplane.")
 
                 
                 poly_dummy.extend(result)

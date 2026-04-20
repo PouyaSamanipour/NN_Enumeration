@@ -603,8 +603,11 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
 
         if use_disk:
             # Open a per-layer HDF5 scratch file for streaming output.
+            # rdcc_nbytes=0: disable chunk cache so every write goes straight to
+            # disk — prevents B-tree corruption when reading the file in the
+            # next layer on WSL / networked filesystems.
             h5_path = os.path.join(tmp_dir, f"layer_{i}.h5")
-            h5f     = h5py.File(h5_path, "w")
+            h5f     = h5py.File(h5_path, "w", rdcc_nbytes=0)
             ds      = h5f.create_dataset(
                 "vertices", shape=(0, n), maxshape=(None, n),
                 dtype=np.float64, chunks=(512, n),
@@ -615,7 +618,7 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
 
             # Open the input file for this layer (i >= 1 only; i==0 uses RAM).
             if _in_h5_path is not None:
-                _h5f_in  = h5py.File(_in_h5_path, "r")
+                _h5f_in  = h5py.File(_in_h5_path, "r", rdcc_nbytes=0)
                 _ds_in   = _h5f_in["vertices"]
                 _offs_in = np.array(_in_offsets)
             else:
@@ -709,7 +712,16 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
                 ds[-len(batch):] = batch
                 for sz in write_buffer_offsets:
                     offsets.append(offsets[-1] + sz)
+            h5f.flush()   # ensure all data reaches the OS buffer before close
             h5f.close()
+            # On WSL / networked filesystems the OS buffer may not be synced yet.
+            # fsync the file descriptor so the next h5py.File(...,"r") sees valid data.
+            try:
+                _sync_fd = os.open(h5_path, os.O_RDONLY)
+                os.fsync(_sync_fd)
+                os.close(_sync_fd)
+            except OSError:
+                pass
             del enumerate_poly
             gc.collect()
 
@@ -727,8 +739,8 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
                 n_kept_total        = 0
                 t0_f                = time.time()
 
-                with h5py.File(h5_path, "r") as h5f_r, \
-                     h5py.File(filtered_h5_path, "w") as h5f_w:
+                with h5py.File(h5_path, "r", rdcc_nbytes=0) as h5f_r, \
+                     h5py.File(filtered_h5_path, "w", rdcc_nbytes=0) as h5f_w:
                     ds_r  = h5f_r["vertices"]
                     ds_w  = h5f_w.create_dataset(
                         "vertices", shape=(0, n), maxshape=(None, n),
