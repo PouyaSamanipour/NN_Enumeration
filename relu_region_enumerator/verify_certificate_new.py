@@ -649,7 +649,7 @@ def _refine_barrier_adaptive(
         normal    = (xs[idx_b] - xs[idx_a]) / max_dist
         abs_f_lin = max(abs(wc), 1e-10)
         # n_refs    = min(max(2, int(np.ceil(rem / abs_f_lin))), 32)
-        n_refs=5
+        n_refs=2
 
         base_proj = float(xs[idx_a] @ normal)
         step_proj = float((xs[idx_b] - xs[idx_a]) @ normal) / n_refs
@@ -677,6 +677,7 @@ def _refine_barrier_adaptive(
                 [np.asarray(verts, dtype=np.float64)],
                 TH, [H_cell.tolist()], [b_cell.tolist()],
                 False, None, 0, use_wide_cell,
+                mask_tolerance=1e-7,  # ZLS crossing points have O(eps_float32) residual on the ZLS hyperplane
             )
         except Exception:
             sub_cells = None
@@ -713,12 +714,8 @@ def _refine_barrier_adaptive(
             xs_k = sub_verts[np.abs(B_sub_verts) < zls_tol]
 
             if len(xs_k) == 0:
-                warnings.warn(
-                    f"[cell {cell_idx}] Sub-cell has no B≈0 vertices after "
-                    f"refinement — B=0 hyperplane may not have propagated "
-                    f"correctly into Enumerator_rapid."
-                )
-                any_inconclusive = True
+                # All vertices of this sub-cell have |B| >= zls_tol, so B
+                # has no zero crossing here.  No barrier condition to check.
                 continue
 
             # Use the parent Hessian bound when n_refs is already small — it

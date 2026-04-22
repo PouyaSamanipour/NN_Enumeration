@@ -46,6 +46,58 @@ from .verify_certificates import verify_lyapunov
 from .ibp_filter import precompute_ibp_weights, vertex_ibp_filter, warmup_numba
 
 
+def _remove_file_with_retry(path, retries=40, delay_s=0.05, strict=False):
+    """Remove a file with retries to tolerate transient Windows locks.
+
+    Returns True when removed (or already absent), False when still locked and
+    strict=False.
+    """
+    for attempt in range(retries):
+        try:
+            os.remove(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except PermissionError:
+            if attempt == retries - 1:
+                if strict:
+                    raise
+                print(f"  [Cleanup] Skipping locked temp file: {path}")
+                return False
+            time.sleep(delay_s)
+
+
+def _open_h5_lock_tolerant(path, mode, retries=5, delay_s=0.05, **kwargs):
+    """Open HDF5 file with a Windows lock-violation fallback.
+
+    Some Windows setups intermittently fail with:
+    "unable to lock file ... Win32 GetLastError() = 33".
+    When that happens, retry with HDF5 file-locking disabled for this process.
+    """
+    try:
+        return h5py.File(path, mode, **kwargs)
+    except OSError as exc:
+        msg = str(exc).lower()
+        if os.name != "nt" or "unable to lock file" not in msg:
+            raise
+
+    # In write/append modes, clear stale file first if a previous run left one.
+    if any(flag in mode for flag in ("w", "a", "x", "+")) and os.path.exists(path):
+        _remove_file_with_retry(path, retries=40, delay_s=delay_s, strict=False)
+
+    os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
+    last_exc = None
+    for _ in range(retries):
+        try:
+            return h5py.File(path, mode, **kwargs)
+        except OSError as exc:
+            last_exc = exc
+            if "unable to lock file" not in str(exc).lower():
+                raise
+            time.sleep(delay_s)
+    raise last_exc
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -607,7 +659,7 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
             # disk — prevents B-tree corruption when reading the file in the
             # next layer on WSL / networked filesystems.
             h5_path = os.path.join(tmp_dir, f"layer_{i}.h5")
-            h5f     = h5py.File(h5_path, "w", rdcc_nbytes=0)
+            h5f     = _open_h5_lock_tolerant(h5_path, "w", rdcc_nbytes=0)
             ds      = h5f.create_dataset(
                 "vertices", shape=(0, n), maxshape=(None, n),
                 dtype=np.float64, chunks=(512, n),
@@ -702,7 +754,7 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
                 _h5f_in.close()
                 _h5f_in = None
             if _in_h5_path is not None and os.path.exists(_in_h5_path):
-                os.remove(_in_h5_path)
+                _remove_file_with_retry(_in_h5_path)
                 _in_h5_path = None
 
             # Flush any remaining buffered output polytopes.
@@ -739,8 +791,8 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
                 n_kept_total        = 0
                 t0_f                = time.time()
 
-                with h5py.File(h5_path, "r", rdcc_nbytes=0) as h5f_r, \
-                     h5py.File(filtered_h5_path, "w", rdcc_nbytes=0) as h5f_w:
+                with _open_h5_lock_tolerant(h5_path, "r", rdcc_nbytes=0) as h5f_r, \
+                     _open_h5_lock_tolerant(filtered_h5_path, "w", rdcc_nbytes=0) as h5f_w:
                     ds_r  = h5f_r["vertices"]
                     ds_w  = h5f_w.create_dataset(
                         "vertices", shape=(0, n), maxshape=(None, n),
@@ -784,7 +836,11 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
                         for sz in fbuf_szs:
                             filtered_offsets.append(filtered_offsets[-1] + sz)
 
-                os.remove(h5_path)
+                # Ensure dataset/file proxy objects are released before delete on Windows.
+                del ds_r, ds_w
+                gc.collect()
+
+                _remove_file_with_retry(h5_path)
                 n_pruned = N_layer - n_kept_total
                 print(f"  [Filter] Layer {i}: {N_layer} → {n_kept_total} "
                       f"({n_pruned} pruned, {100.0*n_pruned/N_layer:.1f}%) "
@@ -838,13 +894,13 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
     if use_disk:
         if _in_h5_path is not None and os.path.exists(_in_h5_path):
             offs_final = np.array(_in_offsets)
-            with h5py.File(_in_h5_path, "r") as hf:
+            with _open_h5_lock_tolerant(_in_h5_path, "r") as hf:
                 ds_final = hf["vertices"]
                 enumerate_poly = [
                     ds_final[offs_final[k]:offs_final[k + 1]][:]
                     for k in range(_in_N)
                 ]
-            os.remove(_in_h5_path)
+            _remove_file_with_retry(_in_h5_path)
             _in_h5_path = None
         else:
             # File already gone or never written (0 survivors).
@@ -885,7 +941,7 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
     # 6. Save full vertex representation to HDF5
     # ------------------------------------------------------------------
     out_h5 = name_file + "_polytope.h5"
-    with h5py.File(out_h5, "w") as f:
+    with _open_h5_lock_tolerant(out_h5, "w") as f:
         file_offsets = np.zeros(len(enumerate_poly) + 1, dtype=np.int64)
         for idx, p in enumerate(enumerate_poly):
             file_offsets[idx + 1] = file_offsets[idx] + len(p)

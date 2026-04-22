@@ -67,14 +67,17 @@ def generate_mask(vertices, hyperplanes, b, tolerance=1e-7):
     masks = np.zeros(n_verts, dtype=np.uint64)
 
     for i in prange(n_verts):
+        cntr=0
         mask = np.uint64(0)
         v    = vertices[i]
         for h in range(n_planes):
             val = hyperplanes[h, :] @ v + b[h]
             if np.abs(val) <= tolerance:
                 mask = mask | (np.uint64(1) << np.uint64(h))
+                cntr += 1
         masks[i] = mask
-
+        if cntr < np.shape(hyperplanes)[1]:
+            print("Warning: bitmask result is sparse, check the tolerance")
     return masks
 
 
@@ -89,13 +92,17 @@ def generate_mask_serial(vertices, hyperplanes, b, tolerance=1e-7):
     n_planes = hyperplanes.shape[0]
     masks = np.zeros(n_verts, dtype=np.uint64)
     for i in range(n_verts):
+        cntr=0
         mask = np.uint64(0)
         v    = vertices[i]
         for h in range(n_planes):
             val = hyperplanes[h, :] @ v + b[h]
             if np.abs(val) <= tolerance:
                 mask = mask | (np.uint64(1) << np.uint64(h))
+                cntr += 1
         masks[i] = mask
+        if cntr < np.shape(hyperplanes)[1]:
+            print("Warning: bitmask result is sparse, check the tolerance")
     return masks
 
 
@@ -453,6 +460,7 @@ def Enumerator_rapid(
     W_neg_ibp=None,
     b_arr_ibp=None,
     is_last_layer=False,
+    mask_tolerance=1e-10,
 ):
     """Enumerate all linear regions produced by one layer of ReLU hyperplanes.
 
@@ -526,7 +534,7 @@ def Enumerator_rapid(
 
                 if use_wide:
                     # Wide path: multi-word uint64 masks, pure Python/NumPy.
-                    masks_w = generate_mask_wide(verts, bh, bb, tolerance=1e-10)
+                    masks_w = generate_mask_wide(verts, bh, bb, tolerance=mask_tolerance)
                     polytops_test, _, created_verts = slice_polytope_wide(
                         verts,
                         np.array(hyperplane_val),
@@ -539,9 +547,9 @@ def Enumerator_rapid(
                     # Use serial version for small polytopes — parallel thread
                     # overhead dominates when vertex count is low.
                     if len(verts) < 200:
-                        masks = generate_mask_serial(verts, bh, bb, tolerance=1e-10)
+                        masks = generate_mask_serial(verts, bh, bb, tolerance=mask_tolerance)
                     else:
-                        masks = generate_mask(verts, bh, bb, tolerance=1e-10)
+                        masks = generate_mask(verts, bh, bb, tolerance=mask_tolerance)
                     if len(masks) < 1000:
                         polytops_test, _, created_verts = slice_polytope_with_hyperplane(
                             verts,
@@ -634,13 +642,16 @@ def generate_mask_wide(vertices, hyperplanes, b, tolerance=1e-7):
 
     for i in prange(n_verts):
         v = vertices[i]
+        cntr = 0
         for h in range(n_planes):
             val = hyperplanes[h, :] @ v + b[h]
             if np.abs(val) <= tolerance:
+                cntr += 1
                 word = np.uint64(h // 64)
                 bit  = np.uint64(h % 64)
                 masks[i, word] |= np.uint64(1) << bit
-
+        if cntr < np.shape(hyperplanes)[1]:
+            print("Warning: bitmask result is sparse, check the tolerance")
     return masks
 
 
