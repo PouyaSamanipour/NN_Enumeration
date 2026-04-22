@@ -275,6 +275,7 @@ if __name__ == "__main__":
     with h5py.File(BOUNDARY_H5, "r") as f:
         offsets = f["offsets"][:]
         sv_all  = f["activation_patterns"][:]
+        BC= f["vertices"][:]   # dummy read to keep file open for generator
     n_cells = len(offsets) - 1
     if MAX_CELLS is not None:
         n_cells = min(n_cells, MAX_CELLS)
@@ -282,12 +283,14 @@ if __name__ == "__main__":
 
     def _bc_generator():
         """Yield one cell's vertex array at a time, reading from HDF5."""
+        BC_new=[]
         with h5py.File(BOUNDARY_H5, "r") as f:
             for i in range(n_cells):
-                yield f["vertices"][offsets[i]:offsets[i+1]].copy()
+                BC_new.append(f["vertices"][offsets[i]:offsets[i+1]].copy())
+        return BC_new        
 
-    BC = _bc_generator()
-    print(f"  {n_cells} boundary cells (streaming from HDF5)\n")
+    BC_new = _bc_generator()
+    # print(f"  {n_cells} boundary cells (streaming from HDF5)\n")
 
     # ── Load dynamics ────────────────────────────────────────────────────────
     print("Loading dynamics ...")
@@ -305,7 +308,7 @@ if __name__ == "__main__":
 
     t_m1 = time.perf_counter()
     summary_m1 = verify_ref(
-        _bc_generator(), sv_all, layer_W, layer_b, W_out,
+        BC_new, sv_all, layer_W, layer_b, W_out,
         boundary_H, boundary_b, model,
         dynamics_name=DYNAMICS,
         continuous_time=True,
@@ -331,7 +334,7 @@ if __name__ == "__main__":
 
     t_m2_start = time.perf_counter()
 
-    for i, vertices in enumerate(_bc_generator()):
+    for i, vertices in enumerate(BC):
         vertices = np.asarray(vertices, dtype=float)
         sv_i     = sv_all[i].ravel()
         p_i      = compute_local_gradient(sv_i, layer_W, W_out)

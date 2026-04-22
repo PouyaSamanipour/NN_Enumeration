@@ -579,20 +579,21 @@ def Enumerator_rapid(
                 poly_dummy.extend(result)
             else:
                 intact_poly.append(enumerate_poly[j])
+        if W_pos_ibp is not None and len(poly_dummy) > 1:
+            is_final_hyperplane = (i == len(hyperplanes) - 1)
+            poly_dummy, _ = vertex_ibp_filter(
+                poly_dummy, W_pos_ibp, W_neg_ibp, b_arr_ibp,
+                is_last_layer=(is_last_layer and is_final_hyperplane),
+                n_known=m + 1 if is_final_hyperplane else m,
+                verbose=False,
+            )
         intact_poly.extend(poly_dummy)
 
         # Per-hyperplane IBP filter on all polytopes (split and non-split).
         # On the final hyperplane: layer m is fully processed → n_known = m+1
         # and is_last_layer is forwarded from the caller, enabling the exact
         # vertex sign check on the final layer instead of IBP approximation.
-        if W_pos_ibp is not None and len(intact_poly) > 1:
-            is_final_hyperplane = (i == len(hyperplanes) - 1)
-            intact_poly, _ = vertex_ibp_filter(
-                intact_poly, W_pos_ibp, W_neg_ibp, b_arr_ibp,
-                is_last_layer=(is_last_layer and is_final_hyperplane),
-                n_known=m + 1 if is_final_hyperplane else m,
-                verbose=False,
-            )
+
 
         boundary_hyperplanes[0] = np.vstack(
             (boundary_hyperplanes[0], hyperplanes[i])

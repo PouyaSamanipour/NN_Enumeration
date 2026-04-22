@@ -823,8 +823,7 @@ def verify_barrier(
     t0 = time.perf_counter()
 
     for i in range(len(BC)):
-        if i==5093:
-            print("debug")
+
         vertices = np.asarray(BC[i], dtype=float)
         BC[i]    = None   # release vertex array immediately — no longer needed
         sv_i     = sv[i].ravel()
