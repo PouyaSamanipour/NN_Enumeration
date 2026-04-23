@@ -649,7 +649,7 @@ def _refine_barrier_adaptive(
         normal    = (xs[idx_b] - xs[idx_a]) / max_dist
         abs_f_lin = max(abs(wc), 1e-10)
         # n_refs    = min(max(2, int(np.ceil(rem / abs_f_lin))), 32)
-        n_refs=2
+        n_refs=4
 
         base_proj = float(xs[idx_a] @ normal)
         step_proj = float((xs[idx_b] - xs[idx_a]) @ normal) / n_refs
