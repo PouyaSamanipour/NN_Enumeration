@@ -509,7 +509,7 @@ def barrier_certificate_cells(model, enumerate_poly, hyperplanes, b, name_file,
 
 def enumeration_function(NN_file, name_file, TH, mode, parallel,
                          verification=None, barrier_model=None,
-                         ibp_filter=True):
+                         ibp_filter=False):
     """Enumerate all polytopic linear regions of a ReLU network over a hypercube.
 
     The function loads a TorchScript-saved ReLU network, extracts its weight

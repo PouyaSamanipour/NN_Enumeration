@@ -21,6 +21,7 @@ slice_polytope_with_hyperplane_jit  -- Alternate JIT slicer with slightly relaxe
 slice_polytope_parallel             -- Two-pass parallel slicer for large polytopes (JIT, parallel).
 Polytope_formation_hd               -- Assemble the two child polytopes from the slicing results.
 Enumerator_rapid                    -- Enumerate all linear regions of one neural-network layer.
+Enumerator_rapid_face               -- Enumerate sub-regions of a ZLS face by sequential hyperplane cuts.
 generate_mask_wide                  -- Wide-mask variant of generate_mask for > 64 hyperplanes.
 slice_polytope_wide                 -- Wide-mask slicer (pure NumPy, no JIT).
 RaggedPolytopeStorage               -- In-memory ragged array for variable-vertex polytopes.
@@ -610,6 +611,128 @@ def Enumerator_rapid(
         enumerate_poly = intact_poly
 
     return enumerate_poly
+
+
+def _dedup_verts(verts: np.ndarray, tol: float = 1e-5) -> np.ndarray:
+    """Remove near-duplicate rows from a vertex array (L-inf grid snap)."""
+    if len(verts) <= 1:
+        return verts
+    scale = 1.0 / tol
+    rounded = np.round(verts * scale).astype(np.int64)
+    _, idx = np.unique(rounded, axis=0, return_index=True)
+    return verts[np.sort(idx)]
+
+
+def Enumerator_rapid_face(
+    hyperplanes,
+    b,
+    x_stars_list,
+    n,
+    mask_tolerance=1e-5,
+    use_wide=False,
+):
+    """Enumerate sub-regions of a ZLS face by sequentially cutting with hyperplanes.
+
+    Each face carries its own dedicated boundary hyperplanes (bh, bb) so that
+    cuts applied to one face never contaminate sibling faces.
+
+    Parameters
+    ----------
+    hyperplanes  : (H, n) array -- cutting hyperplane normals
+    b            : (H,)   array -- cutting hyperplane biases (hval = v @ h + b_i)
+    x_stars_list : list of (verts, bh, bb) tuples
+                     verts : (K, n) float64 -- face vertices
+                     bh    : (B, n) float64 -- dedicated boundary normals
+                     bb    : (B,)   float64 -- dedicated boundary biases
+    n            : int -- ambient input dimension
+    mask_tolerance : float -- hyperplane-incidence tolerance for mask generation
+    use_wide     : bool -- use multi-word uint64 masks when total hyperplanes > 64
+
+    Returns
+    -------
+    list of (verts, bh, bb) tuples -- one per surviving sub-face
+    """
+    enumerate_faces = [
+        (np.asarray(v, dtype=np.float64),
+         np.asarray(bh, dtype=np.float64),
+         np.asarray(bb, dtype=np.float64))
+        for v, bh, bb in x_stars_list
+    ]
+
+    for i in range(len(hyperplanes)):
+        if not enumerate_faces:
+            break
+
+        next_faces = []
+        for face_v, face_bh, face_bb in enumerate_faces:
+            hval = face_v @ hyperplanes[i] + b[i]
+
+            if hval.min() >= -1e-5 or hval.max() <= 1e-5:
+                next_faces.append((face_v, face_bh, face_bb))
+                continue
+
+            # Bit index for the new cut = number of face's own boundary hyperplanes
+            global_bit_index = len(face_bh)
+            current_use_wide = use_wide or (global_bit_index >= 64)
+
+            if current_use_wide:
+                words_needed = (global_bit_index + 64) // 64
+                masks_w = generate_mask_face_wide(face_v, face_bh, face_bb, tolerance=mask_tolerance)
+                if masks_w.shape[1] < words_needed:
+                    pad     = np.zeros((len(masks_w), words_needed - masks_w.shape[1]),
+                                       dtype=np.uint64)
+                    masks_w = np.hstack([masks_w, pad])
+                (verts_in, verts_out), _, created = slice_face_wide(
+                    face_v, hval, masks_w, global_bit_index, n
+                )
+            else:
+                masks_n, flag = generate_mask_face_serial(face_v, face_bh, face_bb, tolerance=mask_tolerance)
+                # if flag == 1:
+                #     print("Warning: mask generation is sparse, check the tolerance")
+                (verts_in, verts_out), _, created = slice_face_with_hyperplane(
+                    face_v, hval, masks_n, global_bit_index, n
+                )
+
+            if len(created) == 0:
+                next_faces.append((face_v, face_bh, face_bb))
+                print("Warning: slicer returned no intersection points; skipping slice.")
+                continue
+
+            # Extended boundary for this face = face's own walls + new cut
+            bh_ext = np.vstack([face_bh, hyperplanes[i]])
+            bb_ext = np.append(face_bb, float(b[i]))
+
+            if len(verts_in) == 0 and len(verts_out) == 0:
+                print("Warning: slicer returned no vertices for either side; skipping slice.")
+                continue
+
+            if len(verts_in) > 0:
+                # st1=time.time()
+                fv_in = _dedup_verts(np.asarray(verts_in, dtype=np.float64))
+                # if len(fv_in)!=len(verts_in):
+                #     print(f"Deduplication reduced vertex count from {len(verts_in)} to {len(fv_in)} for the inside face.")
+                # print(f"Deduplication took {time.time() - st1:.5f} seconds for {len(verts_in)} vertices.")
+                # st1=time.time()
+                # fv_in1 = _dedup_verts_nb(np.asarray(verts_in, dtype=np.float64))
+                # print(f"Numba deduplication took {time.time() - st1:.5f} seconds for {len(verts_in)} vertices.")
+
+                # if len(fv_in) > 1000:
+                #     print("Warning: slicer returned a large number of vertices for the inside face; check the mask tolerance.")
+                bh_in, bb_in = finding_side(bh_ext, fv_in, bb_ext)
+                next_faces.append((fv_in, bh_in, bb_in))
+
+            if len(verts_out) > 0:
+                fv_out = _dedup_verts(np.asarray(verts_out, dtype=np.float64))
+                # if len(fv_out)!=len(verts_out):
+                #     print(f"Deduplication reduced vertex count from {len(verts_out)} to {len(fv_out)} for the outside face.")
+                # if len(fv_out) > 1000:
+                #     print("Warning: slicer returned a large number of vertices for the outside face; check the mask tolerance.")
+                bh_out, bb_out = finding_side(bh_ext, fv_out, bb_ext)
+                next_faces.append((fv_out, bh_out, bb_out))
+
+        enumerate_faces = next_faces
+
+    return enumerate_faces
 
 
 # ---------------------------------------------------------------------------
@@ -1701,3 +1824,374 @@ def get_cell_hyperplanes_input_space(
     b_all = np.concatenate([*b_planes, boundary_b])
 
     return H_all, b_all
+
+
+
+
+
+@njit
+def generate_mask_face_serial(vertices, hyperplanes, b, tolerance=1e-7):
+    """Serial bitmask generation for vertices of an (n-1)-dimensional face.
+    Sparsity check expects at least n-1 bits set per vertex."""
+    n_verts  = vertices.shape[0]
+    n_planes = hyperplanes.shape[0]
+    n_dim    = vertices.shape[1]
+    masks    = np.zeros(n_verts, dtype=np.uint64)
+    flag=0
+
+    for i in range(n_verts):
+        mask = np.uint64(0)
+        cntr = 0
+        v    = vertices[i]
+        for h in range(n_planes):
+            val = hyperplanes[h, :] @ v + b[h]
+            if np.abs(val) <= tolerance:
+                mask |= (np.uint64(1) << np.uint64(h))
+                cntr += 1
+        masks[i] = mask
+        if cntr < n_dim - 1:
+            flag=1
+            # print(np.ascontiguousarray(hyperplanes) @ v + b)
+    return masks,flag
+
+
+@njit(parallel=True)
+def generate_mask_face(vertices, hyperplanes, b, tolerance=1e-7):
+    """Parallel bitmask generation for vertices of an (n-1)-dimensional face.
+    Sparsity check expects at least n-1 bits set per vertex."""
+    n_verts  = vertices.shape[0]
+    n_planes = hyperplanes.shape[0]
+    n_dim    = vertices.shape[1]
+    masks    = np.zeros(n_verts, dtype=np.uint64)
+    flag=0
+    for i in prange(n_verts):
+        mask = np.uint64(0)
+        cntr = 0
+        v    = vertices[i]
+        for h in range(n_planes):
+            val = hyperplanes[h, :] @ v + b[h]
+            if np.abs(val) <= tolerance:
+                mask |= (np.uint64(1) << np.uint64(h))
+                cntr += 1
+        masks[i] = mask
+        if cntr < n_dim - 1:
+            # print(np.ascontiguousarray(hyperplanes) @ v + b)
+            # print("Warning: face vertex has fewer than n-1 incidences, check tolerance")
+            falg=1
+    return masks,falg
+
+
+@njit
+def slice_face_with_hyperplane(face_verts, hyperplane_val, masks, i, n):
+    """Slice an (n-1)-dimensional face with a hyperplane (narrow uint64 masks).
+
+    Adjacency condition: n-2 shared hyperplanes (one fewer than full polytope
+    slicer) because the face hyperplane is already implicitly shared.
+
+    Parameters
+    ----------
+    face_verts     : (V, n) float64 array
+    hyperplane_val : (V,)   float64 array
+    masks          : (V,)   uint64 array
+    i              : int -- global bit index of the cutting hyperplane
+    n              : int -- ambient input dimension
+
+    Returns
+    -------
+    [verts_in, verts_out], [masks_in, masks_out], created_verts
+    """
+    ONE        = np.uint64(1)
+    req_shared = n - 2   # key difference from full polytope slicer
+
+    strict_index_in  = np.where(hyperplane_val < -1e-9)[0]
+    strict_index_out = np.where(hyperplane_val >  1e-9)[0]
+    index_in  = np.where(hyperplane_val <= 1e-5)[0]
+    index_out = np.where(hyperplane_val >= -1e-5)[0]
+
+    max_new = len(index_in) * len(index_out)
+    new_verts_buffer = np.zeros((max_new, n), dtype=np.float64)
+    new_masks_buffer = np.zeros(max_new,      dtype=np.uint64)
+
+    count = 0
+    for k in range(len(strict_index_in)):
+        u_idx  = strict_index_in[k]
+        mask_u = masks[u_idx]
+
+        for l in range(len(strict_index_out)):
+            v_idx = strict_index_out[l]
+
+            if hyperplane_val[u_idx] < -1e-9 and hyperplane_val[v_idx] > 1e-9:
+                mask_v      = masks[v_idx]
+                shared_mask = mask_u & mask_v
+
+                n_shared = 0
+                temp = shared_mask
+                while temp > np.uint64(0) and n_shared < req_shared:
+                    temp &= temp - ONE
+                    n_shared += 1
+
+                if n_shared >= req_shared:
+                    d1 = hyperplane_val[u_idx]
+                    d2 = hyperplane_val[v_idx]
+                    t  = -d1 / (d2 - d1)
+                    new_verts_buffer[count] = (
+                        face_verts[u_idx]
+                        + t * (face_verts[v_idx] - face_verts[u_idx])
+                    )
+                    new_masks_buffer[count] = shared_mask | (mask_u & (ONE << np.uint64(i)))
+                    count += 1
+
+    created_verts = new_verts_buffer[:count]
+    created_masks = new_masks_buffer[:count]
+
+    verts_in  = np.vstack((face_verts[index_in],  created_verts))
+    masks_in  = np.concatenate((masks[index_in],  created_masks))
+    verts_out = np.vstack((face_verts[index_out], created_verts))
+    masks_out = np.concatenate((masks[index_out], created_masks))
+
+    return [verts_in, verts_out], [masks_in, masks_out], created_verts
+
+
+# ---------------------------------------------------------------------------
+# Wide-mask variants  (> 64 hyperplanes)
+# ---------------------------------------------------------------------------
+
+@njit(parallel=True)
+def generate_mask_face_wide(vertices, hyperplanes, b, tolerance=1e-7):
+    """Multi-word bitmask generation for vertices of an (n-1)-dimensional face.
+    Sparsity check expects at least n-1 bits set per vertex."""
+    n_verts   = vertices.shape[0]
+    n_planes  = hyperplanes.shape[0]
+    n_dim     = vertices.shape[1]
+    num_words = (n_planes + 63) // 64
+    masks     = np.zeros((n_verts, num_words), dtype=np.uint64)
+
+    for i in prange(n_verts):
+        v    = vertices[i]
+        cntr = 0
+        for h in range(n_planes):
+            val = hyperplanes[h, :] @ v + b[h]
+            if np.abs(val) <= tolerance:
+                cntr += 1
+                word = np.uint64(h // 64)
+                bit  = np.uint64(h % 64)
+                masks[i, word] |= np.uint64(1) << bit
+        if cntr < n_dim - 1:
+            print("Warning: face vertex has fewer than n-1 incidences, check tolerance")
+    return masks
+
+
+@njit
+def _slice_face_wide_seq(face_verts, hyperplane_val, masks_w, i, n):
+    """Sequential wide-mask face slicer. Adjacency condition: n-2 shared bits."""
+    num_words  = masks_w.shape[1]
+    req_shared = n - 2   # key difference from full polytope slicer
+
+    strict_index_in  = np.where(hyperplane_val < -1e-9)[0]
+    strict_index_out = np.where(hyperplane_val >  1e-9)[0]
+    index_in  = np.where(hyperplane_val <= 1e-5)[0]
+    index_out = np.where(hyperplane_val >= -1e-5)[0]
+
+    max_new = len(index_in) * len(index_out)
+    new_verts_buffer = np.zeros((max_new, n),          dtype=np.float64)
+    new_masks_buffer = np.zeros((max_new, num_words),   dtype=np.uint64)
+    count = 0
+
+    for k in range(len(strict_index_in)):
+        u_idx  = strict_index_in[k]
+        mask_u = masks_w[u_idx]
+
+        for l in range(len(strict_index_out)):
+            v_idx = strict_index_out[l]
+
+            if hyperplane_val[u_idx] < -1e-9 and hyperplane_val[v_idx] > 1e-9:
+                mask_v      = masks_w[v_idx]
+                shared_mask = mask_u & mask_v
+
+                if _wide_popcount_ge(mask_u, mask_v, req_shared, num_words):
+                    d1 = hyperplane_val[u_idx]
+                    d2 = hyperplane_val[v_idx]
+                    t  = -d1 / (d2 - d1)
+                    new_verts_buffer[count] = (
+                        face_verts[u_idx]
+                        + t * (face_verts[v_idx] - face_verts[u_idx])
+                    )
+                    new_masks_buffer[count] = _wide_mask_or_and(
+                        shared_mask, mask_u, i, num_words
+                    )
+                    count += 1
+
+    created_verts = new_verts_buffer[:count]
+    created_masks = new_masks_buffer[:count]
+
+    n_in  = len(index_in)
+    n_out = len(index_out)
+
+    verts_in  = np.empty((n_in  + count, n),          dtype=np.float64)
+    masks_in  = np.empty((n_in  + count, num_words),   dtype=np.uint64)
+    verts_out = np.empty((n_out + count, n),           dtype=np.float64)
+    masks_out = np.empty((n_out + count, num_words),   dtype=np.uint64)
+
+    verts_in[:n_in]   = face_verts[index_in]
+    masks_in[:n_in]   = masks_w[index_in]
+    verts_in[n_in:]   = created_verts
+    masks_in[n_in:]   = created_masks
+
+    verts_out[:n_out] = face_verts[index_out]
+    masks_out[:n_out] = masks_w[index_out]
+    verts_out[n_out:] = created_verts
+    masks_out[n_out:] = created_masks
+
+    return [verts_in, verts_out], [masks_in, masks_out], created_verts
+
+
+@njit(parallel=True)
+def _slice_face_wide_par(face_verts, hyperplane_val, masks_w, i, n):
+    """Parallel wide-mask face slicer (prange over u-vertices).
+    Adjacency condition: n-2 shared bits."""
+    num_words  = masks_w.shape[1]
+    req_shared = n - 2   # key difference from full polytope slicer
+
+    strict_index_in  = np.where(hyperplane_val < -1e-9)[0]
+    strict_index_out = np.where(hyperplane_val >  1e-9)[0]
+    index_in  = np.where(hyperplane_val <= 1e-5)[0]
+    index_out = np.where(hyperplane_val >= -1e-5)[0]
+
+    n_in_s  = len(strict_index_in)
+    n_out_s = len(strict_index_out)
+    max_new = n_in_s * n_out_s
+
+    new_verts_buffer = np.zeros((max_new, n),          dtype=np.float64)
+    new_masks_buffer = np.zeros((max_new, num_words),   dtype=np.uint64)
+    valid            = np.zeros(max_new,                dtype=nb.boolean)
+
+    for k in prange(n_in_s):
+        u_idx  = strict_index_in[k]
+        mask_u = masks_w[u_idx]
+        d1     = hyperplane_val[u_idx]
+
+        for l in range(n_out_s):
+            v_idx    = strict_index_out[l]
+            flat_idx = k * n_out_s + l
+
+            if d1 < -1e-9 and hyperplane_val[v_idx] > 1e-9:
+                mask_v = masks_w[v_idx]
+                if _wide_popcount_ge(mask_u, mask_v, req_shared, num_words):
+                    d2 = hyperplane_val[v_idx]
+                    t  = -d1 / (d2 - d1)
+                    for dim in range(n):
+                        new_verts_buffer[flat_idx, dim] = (
+                            face_verts[u_idx, dim]
+                            + t * (face_verts[v_idx, dim] - face_verts[u_idx, dim])
+                        )
+                    new_masks_buffer[flat_idx] = _wide_mask_or_and(
+                        mask_u & mask_v, mask_u, i, num_words
+                    )
+                    valid[flat_idx] = True
+
+    created_verts, created_masks = _compact_wide(
+        new_verts_buffer, new_masks_buffer, valid, n, num_words
+    )
+
+    n_in  = len(index_in)
+    n_out = len(index_out)
+    count = len(created_verts)
+
+    verts_in  = np.empty((n_in  + count, n),          dtype=np.float64)
+    masks_in  = np.empty((n_in  + count, num_words),   dtype=np.uint64)
+    verts_out = np.empty((n_out + count, n),           dtype=np.float64)
+    masks_out = np.empty((n_out + count, num_words),   dtype=np.uint64)
+
+    verts_in[:n_in]   = face_verts[index_in]
+    masks_in[:n_in]   = masks_w[index_in]
+    verts_in[n_in:]   = created_verts
+    masks_in[n_in:]   = created_masks
+
+    verts_out[:n_out] = face_verts[index_out]
+    masks_out[:n_out] = masks_w[index_out]
+    verts_out[n_out:] = created_verts
+    masks_out[n_out:] = created_masks
+
+    return [verts_in, verts_out], [masks_in, masks_out], created_verts
+
+
+def slice_face_wide(face_verts, hyperplane_val, masks_w, i, n):
+    """Dispatch wide-mask face slicer: parallel for large faces, serial otherwise.
+
+    Parameters
+    ----------
+    face_verts     : (V, n) float64 array
+    hyperplane_val : (V,)   float64 array
+    masks_w        : (V, num_words) uint64 array
+    i              : int -- global bit index of the cutting hyperplane
+    n              : int -- ambient input dimension
+
+    Returns
+    -------
+    [verts_in, verts_out], [masks_in, masks_out], created_verts
+    """
+    n_in_s  = int(np.sum(hyperplane_val < -1e-9))
+    n_out_s = int(np.sum(hyperplane_val >  1e-9))
+    if n_in_s * n_out_s > _PAR_THRESHOLD:
+        return _slice_face_wide_par(face_verts, hyperplane_val, masks_w, i, n)
+    return _slice_face_wide_seq(face_verts, hyperplane_val, masks_w, i, n)
+
+
+
+@njit
+def finding_side(boundary_hyperplanes, enumerate_poly, border_bias):
+    n = boundary_hyperplanes.shape[1]
+    mask = np.zeros(len(boundary_hyperplanes), dtype=np.bool_)
+    for j in range(len(boundary_hyperplanes)):
+        dum = boundary_hyperplanes[j] @ enumerate_poly.T + border_bias[j]
+        if np.sum(np.abs(dum) < 1e-5) >= n - 1:
+            mask[j] = True
+    return boundary_hyperplanes[mask], border_bias[mask]
+# @njit
+# def finding_side(boundary_hyperplanes,enumerate_poly,border_bias):
+
+#     b_h=[]
+#     b_b=[]
+#     n=len(boundary_hyperplanes[0])
+#     for j,i in enumerate(boundary_hyperplanes):
+#         dum=np.dot(np.ascontiguousarray(i),np.ascontiguousarray(enumerate_poly.T))+border_bias[j]
+#         if np.sum(np.abs(dum)<1e-5)>=n-1:
+#             b_h.append(i)
+#             b_b.append(border_bias[j])
+
+#     return b_h,b_b
+
+
+@njit(cache=True)
+def _dedup_verts_nb(verts, tol=1e-8):
+    """Remove near-duplicate rows using pairwise L-inf distance."""
+    n_verts = verts.shape[0]
+    ndim    = verts.shape[1]
+    if n_verts <= 1:
+        return verts
+    keep = np.ones(n_verts, dtype=np.bool_)
+    for i in range(1, n_verts):
+        for j in range(i):
+            if not keep[j]:
+                continue
+            d = 0.0
+            for k in range(ndim):
+                diff = verts[i, k] - verts[j, k]
+                if diff < 0.0:
+                    diff = -diff
+                if diff > d:
+                    d = diff
+            if d < tol:
+                keep[i] = False
+                break
+    count = 0
+    for i in range(n_verts):
+        if keep[i]:
+            count += 1
+    out = np.empty((count, ndim), dtype=np.float64)
+    idx = 0
+    for i in range(n_verts):
+        if keep[i]:
+            out[idx] = verts[i]
+            idx += 1
+    return out

@@ -22,6 +22,7 @@ from .visualization import (
 )
 from .bitwise_utils import (
     Enumerator_rapid,
+    Enumerator_rapid_face,
     generate_mask,
     slice_polytope_with_hyperplane,
     slice_polytope_with_hyperplane_jit,
@@ -45,6 +46,7 @@ __all__ = [
     "plot_hyperplanes_and_vertices",
     "plotting_results",
     "Enumerator_rapid",
+    "Enumerator_rapid_face",
     "generate_mask",
     "slice_polytope_with_hyperplane",
     "slice_polytope_with_hyperplane_jit",

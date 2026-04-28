@@ -96,6 +96,7 @@ class CellResult:
     r_i           : float
     remainder     : float
     max_condition : float
+    time_s        : float = 0.0
 
 
 @dataclass
@@ -600,6 +601,8 @@ def _refine_barrier_adaptive(
     boundary_b      : np.ndarray,
     TH              : list,
     model_dtype,
+    refinement_timeout_s : float = 120.0,
+    max_slicer_verts     : Optional[int] = 1000,
 ) -> Tuple[Label, float, float, float, Optional[Counterexample]]:
     """
     Iterative adaptive refinement — replaces the recursive version.
@@ -628,8 +631,36 @@ def _refine_barrier_adaptive(
     worst_r          = 0.0
     worst_rem        = 0.0
     any_inconclusive = False
+    _deadline        = time.perf_counter() + refinement_timeout_s
+    n_subcells_total = 0   # sub-cells pushed to queue across all splits
+    n_safe_sub       = 0   # sub-cells certified SAFE_TAYLOR during refinement
 
     while queue:
+        if time.perf_counter() > _deadline:
+            radii = []
+            rems  = []
+            verts_counts = []
+            for (xs_q, sv_q, _, rem_q, _, _, _) in queue:
+                c_q = xs_q.mean(axis=0)
+                radii.append(float(np.linalg.norm(xs_q - c_q, axis=1).max()) if len(xs_q) > 1 else 0.0)
+                rems.append(float(rem_q))
+                verts_counts.append(len(sv_q))
+            r_arr  = np.array(radii)
+            re_arr = np.array(rems)
+            vc_arr = np.array(verts_counts)
+            print(
+                f"  [cell {cell_idx}] refinement timeout ({refinement_timeout_s:.1f}s)\n"
+                f"    sub-cells created={n_subcells_total}  safe_taylor={n_safe_sub}  "
+                f"still queued={len(queue)}\n"
+                f"    queued r_i  : min={r_arr.min():.3f}  mean={r_arr.mean():.3f}  "
+                f"max={r_arr.max():.3f}\n"
+                f"    queued rem  : min={re_arr.min():.3e}  mean={re_arr.mean():.3e}  "
+                f"max={re_arr.max():.3e}\n"
+                f"    queued verts: min={vc_arr.min()}  mean={vc_arr.mean():.0f}  "
+                f"max={vc_arr.max()}"
+            )
+            any_inconclusive = True
+            break
         xs, verts, wc, rem, depth, bH, bb = queue.popleft()
 
         if depth == 0 or len(xs) < 2:
@@ -671,22 +702,37 @@ def _refine_barrier_adaptive(
         # which causes spurious adjacency hits and an explosion of intersection
         # vertices.
         use_wide_cell = (len(H_cell) + len(H_refine)) > 64
-        try:
-            sub_cells = Enumerator_rapid(
-                H_refine, b_refine,
-                [np.asarray(verts, dtype=np.float64)],
-                TH, [H_cell.tolist()], [b_cell.tolist()],
-                False, None, 0, use_wide_cell,
-                mask_tolerance=1e-7,  # ZLS crossing points have O(eps_float32) residual on the ZLS hyperplane
-            )
-        except Exception:
+
+        # Guard: both wide and narrow slicers allocate O(V²) pairs internally.
+        # Cap unconditionally to avoid OOM regardless of use_wide_cell.
+        # Pass max_slicer_verts=None to disable (e.g. single-cell tests).
+        if max_slicer_verts is not None and len(verts) > max_slicer_verts:
+            if n > 10:
+                print(f"  [cell {cell_idx}] refinement vertex-count guard "
+                      f"({len(verts)} > {max_slicer_verts}, n={n}) — INCONCLUSIVE")
+                return Label.INCONCLUSIVE, worst_M, worst_r, worst_rem, None
             sub_cells = None
+            _slicer_skip = True
+        else:
+            _slicer_skip = False
+            try:
+                sub_cells = Enumerator_rapid(
+                    H_refine, b_refine,
+                    [np.asarray(verts, dtype=np.float64)],
+                    TH, [H_cell.tolist()], [b_cell.tolist()],
+                    False, None, 0, use_wide_cell,
+                    mask_tolerance=1e-5,  # float32 accumulated error in 12D is O(sqrt(n_neurons)*eps_f32)~1e-6; match slicer soft-boundary 1e-5
+                )
+            except Exception as _exc:
+                print(f"  [cell {cell_idx}] Enumerator_rapid raised {type(_exc).__name__}: {_exc}")
+                sub_cells = None
         # ── Enumerator_rapid couldn't split ──────────────────────────────────
         if sub_cells is None or len(sub_cells) <= 1:
             _refine_stats["slab_fallback"] += 1
             n_verts = len(verts)
             n_sub   = len(sub_cells) if sub_cells is not None else 0
-            print(f"  [cell {cell_idx}] Enumerator_rapid returned {n_sub} sub-cells "
+            reason  = "vertex-count guard" if _slicer_skip else f"returned {n_sub} sub-cells"
+            print(f"  [cell {cell_idx}] Enumerator_rapid {reason} "
                   f"(parent has {n_verts} verts, E={len(xs)}, n_refs={n_refs})")
             any_inconclusive = True
             continue
@@ -738,8 +784,11 @@ def _refine_barrier_adaptive(
                 if len(xs_k) >= 2:
                     queue.append((xs_k, sub_verts, wc_i, rem_i, depth - 1,
                                   bH_child, bb_child))
+                    n_subcells_total += 1
                 else:
                     any_inconclusive = True
+            else:  # SAFE_TAYLOR
+                n_safe_sub += 1
             # SAFE_TAYLOR: sub_verts goes out of scope here — freed immediately
 
     if any_inconclusive:
@@ -764,7 +813,10 @@ def verify_barrier(
     continuous_time     : bool  = True,
     early_exit          : bool  = True,
     refinement_max_depth: int   = 8,
+    refinement_timeout_s: float = float('inf'),
     TH                  : list  = None,
+    max_slicer_verts    : Optional[int] = 1000,
+    cell_timeout_s      : Optional[float] = None,
 ) -> VerificationSummary:
     """
     Formally verify barrier certificate on all boundary-adjacent cells.
@@ -805,9 +857,9 @@ def verify_barrier(
     use_wide       = (total_neurons + len(boundary_H) > 64)
     model_dtype    = next(barrier_model.parameters()).dtype
 
+    n_dim = layer_W[0].shape[1]
     # Default TH: infer from boundary_b (assumes box domain: H=[I; -I], b=[TH; TH])
     if TH is None:
-        n_dim = layer_W[0].shape[1]
         TH = list(boundary_b[:n_dim])
 
     summary = VerificationSummary(mode="barrier", dynamics_name=dynamics_name)
@@ -820,6 +872,7 @@ def verify_barrier(
     t0 = time.perf_counter()
 
     for i in range(len(BC)):
+        t_cell_start = time.perf_counter()
 
         vertices = np.asarray(BC[i], dtype=float)
         BC[i]    = None   # release vertex array immediately — no longer needed
@@ -851,6 +904,17 @@ def verify_barrier(
                 continue
             # else: at least one vertex violates — fall through to ZLS
 
+        # Guard: slice_polytope_wide is O(V²) — cap to avoid OOM on large cells.
+        # Pass max_slicer_verts=None to disable (e.g. single-cell tests).
+        if max_slicer_verts is not None and use_wide and len(vertices) > max_slicer_verts:
+            print(f"  [cell {i}] ZLS vertex-count guard ({len(vertices)} > {max_slicer_verts}) — INCONCLUSIVE")
+            summary.n_inconclusive += 1
+            summary.results.append(CellResult(
+                label=Label.INCONCLUSIVE, cell_idx=i,
+                M_i=0.0, r_i=0.0, remainder=0.0, max_condition=0.0,
+            ))
+            continue
+
         # Find zero level set crossings and the two ZLS sub-polytopes
         x_stars, x_masks, verts_B_neg, verts_B_pos = _get_zero_level_set_crossings(
             vertices, sv_i, B_vals,
@@ -866,6 +930,18 @@ def verify_barrier(
             ))
             summary.n_safe_taylor += 1
             continue
+
+        # Per-cell timeout check after ZLS (only enforced when cell_timeout_s set)
+        if cell_timeout_s is not None:
+            elapsed = time.perf_counter() - t_cell_start
+            if elapsed > cell_timeout_s:
+                print(f"  [cell {i}] per-cell timeout ({cell_timeout_s:.1f}s) after ZLS — INCONCLUSIVE")
+                summary.n_inconclusive += 1
+                summary.results.append(CellResult(
+                    label=Label.INCONCLUSIVE, cell_idx=i,
+                    M_i=0.0, r_i=0.0, remainder=0.0, max_condition=0.0,
+                ))
+                continue
 
         # Two-step labeling
         label, M_i, r_i, remainder, worst_cond, ce = _two_step_label(
@@ -905,6 +981,12 @@ def verify_barrier(
                 verts_B_neg if len(verts_B_neg) <= len(verts_B_pos) else verts_B_pos
             )
 
+            _refine_budget = refinement_timeout_s
+            if cell_timeout_s is not None:
+                _refine_budget = min(
+                    _refine_budget,
+                    cell_timeout_s - (time.perf_counter() - t_cell_start),
+                )
             label, M_i, r_i, remainder, ce = _refine_barrier_adaptive(
                 x_stars, worst_cond, remainder,
                 M_i,  # reuse parent Hessian bound — valid for all sub-cells
@@ -913,6 +995,8 @@ def verify_barrier(
                 refinement_max_depth,
                 sub_verts_for_refine, sv_i, layer_W, layer_b,
                 zls_boundary_H, zls_boundary_b, TH, model_dtype,
+                refinement_timeout_s=_refine_budget,
+                max_slicer_verts=max_slicer_verts,
             )
 
         if ce is not None and summary.counterexample is None:
