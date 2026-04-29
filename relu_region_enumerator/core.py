@@ -41,7 +41,7 @@ from .hessian_bound import HessianBounder, compute_local_gradient
 
 from .bitwise_utils import Enumerator_rapid,finding_deep_hype, generate_mask_wide,slice_polytope_wide
 from .Dynamics import load_dynamics, list_systems
-from .verify_certificate_new import verify_barrier
+from .verify_certificate_face import verify_barrier
 from .verify_certificates import verify_lyapunov
 from .ibp_filter import precompute_ibp_weights, vertex_ibp_filter, warmup_numba
 
@@ -509,7 +509,7 @@ def barrier_certificate_cells(model, enumerate_poly, hyperplanes, b, name_file,
 
 def enumeration_function(NN_file, name_file, TH, mode, parallel,
                          verification=None, barrier_model=None,
-                         ibp_filter=False):
+                         ibp_filter=True):
     """Enumerate all polytopic linear regions of a ReLU network over a hypercube.
 
     The function loads a TorchScript-saved ReLU network, extracts its weight

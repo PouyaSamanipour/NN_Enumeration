@@ -46,7 +46,7 @@ from .ibp_filter import vertex_ibp_filter
 # ---------------------------------------------------------------------------
 
 @njit(parallel=True)
-def generate_mask(vertices, hyperplanes, b, tolerance=1e-7):
+def generate_mask(vertices, hyperplanes, b, tolerance=1e-5):
     """Compute a hyperplane-incidence bitmask for each vertex.
 
     A bit h is set in the mask for vertex v if |hyperplanes[h] · v + b[h]|
@@ -83,7 +83,7 @@ def generate_mask(vertices, hyperplanes, b, tolerance=1e-7):
 
 
 @njit
-def generate_mask_serial(vertices, hyperplanes, b, tolerance=1e-7):
+def generate_mask_serial(vertices, hyperplanes, b, tolerance=1e-5):
     """Serial version of generate_mask — faster for small vertex counts.
 
     Avoids numba thread-pool overhead that dominates when V is small
@@ -532,10 +532,15 @@ def Enumerator_rapid(
             if sgn_var[j] < -1e-9:
                 hyperplane_val = np.dot(enumerate_poly[j], hyperplanes[i].T) + b[i]
                 verts = np.array(enumerate_poly[j])
-
+                bh_n,bb_n=finding_side_polytope(bh,verts,bb)
+                # sides,hypes=finding_side_old(bh,verts,bb)
+                # if len(bh_n)!=len(hypes):
+                    # print("check")
+                if len(bh_n)<=64:
+                    use_wide=False
                 if use_wide:
                     # Wide path: multi-word uint64 masks, pure Python/NumPy.
-                    masks_w = generate_mask_wide(verts, bh, bb, tolerance=mask_tolerance)
+                    masks_w = generate_mask_wide(verts, bh_n, bb_n, tolerance=mask_tolerance)
                     polytops_test, _, created_verts = slice_polytope_wide(
                         verts,
                         np.array(hyperplane_val),
@@ -548,9 +553,9 @@ def Enumerator_rapid(
                     # Use serial version for small polytopes — parallel thread
                     # overhead dominates when vertex count is low.
                     if len(verts) < 200:
-                        masks = generate_mask_serial(verts, bh, bb, tolerance=mask_tolerance)
+                        masks = generate_mask_serial(verts, bh_n, bb_n, tolerance=mask_tolerance)
                     else:
-                        masks = generate_mask(verts, bh, bb, tolerance=mask_tolerance)
+                        masks = generate_mask(verts, bh_n, bb_n, tolerance=mask_tolerance)
                     if len(masks) < 1000:
                         polytops_test, _, created_verts = slice_polytope_with_hyperplane(
                             verts,
@@ -740,7 +745,7 @@ def Enumerator_rapid_face(
 # ---------------------------------------------------------------------------
 
 @njit(parallel=True)
-def generate_mask_wide(vertices, hyperplanes, b, tolerance=1e-7):
+def generate_mask_wide(vertices, hyperplanes, b, tolerance=1e-5):
     """Compute multi-word hyperplane-incidence bitmasks for each vertex.
 
     Identical semantics to :func:`generate_mask` but stores each mask as a
@@ -1830,7 +1835,7 @@ def get_cell_hyperplanes_input_space(
 
 
 @njit
-def generate_mask_face_serial(vertices, hyperplanes, b, tolerance=1e-7):
+def generate_mask_face_serial(vertices, hyperplanes, b, tolerance=1e-5):
     """Serial bitmask generation for vertices of an (n-1)-dimensional face.
     Sparsity check expects at least n-1 bits set per vertex."""
     n_verts  = vertices.shape[0]
@@ -1957,7 +1962,7 @@ def slice_face_with_hyperplane(face_verts, hyperplane_val, masks, i, n):
 # ---------------------------------------------------------------------------
 
 @njit(parallel=True)
-def generate_mask_face_wide(vertices, hyperplanes, b, tolerance=1e-7):
+def generate_mask_face_wide(vertices, hyperplanes, b, tolerance=1e-5):
     """Multi-word bitmask generation for vertices of an (n-1)-dimensional face.
     Sparsity check expects at least n-1 bits set per vertex."""
     n_verts   = vertices.shape[0]
@@ -2137,6 +2142,17 @@ def slice_face_wide(face_verts, hyperplane_val, masks_w, i, n):
     return _slice_face_wide_seq(face_verts, hyperplane_val, masks_w, i, n)
 
 
+@njit
+def finding_side_polytope(boundary_hyperplanes, enumerate_poly, border_bias):
+    n = boundary_hyperplanes.shape[1]
+    mask = np.zeros(len(boundary_hyperplanes), dtype=np.bool_)
+    for j in range(len(boundary_hyperplanes)):
+        dum = boundary_hyperplanes[j] @ enumerate_poly.T + border_bias[j]
+        if np.sum(np.abs(dum) < 1e-3) >= n:
+            mask[j] = True
+    return boundary_hyperplanes[mask], border_bias[mask]
+
+
 
 @njit
 def finding_side(boundary_hyperplanes, enumerate_poly, border_bias):
@@ -2195,3 +2211,25 @@ def _dedup_verts_nb(verts, tol=1e-8):
             out[idx] = verts[i]
             idx += 1
     return out
+
+
+@njit
+def finding_side_old(boundary_hyperplanes,enumerate_poly,border_bias):
+    # side=list()
+    # hyp_f=List()
+    side=List()
+    # side=[]
+    hyp_f=[]
+    n=len(boundary_hyperplanes[0])
+    # test=np.reshape(border_bias,(len(border_bias),1))
+    # test=border_bias.reshape((len(border_bias),-1))
+    dum=np.dot(boundary_hyperplanes,enumerate_poly.T)+border_bias.reshape((len(border_bias),-1))
+    # dum=np.dot(boundary_hyperplanes,(np.array(enumerate_poly)).T)+test
+    for j,i in enumerate(dum):
+        res=[k for k,l in enumerate(i) if np.abs(l)<1e-10]
+        if len(res)>=n:
+            if res not in side:
+                side.append(((res)))
+                hyp_f.append((np.append(boundary_hyperplanes[j],border_bias[j])))
+                # vertices=(dum[j])[dum[j]<1e-10 and dum[j]>-1e-10]
+    return side,hyp_f
