@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"/c/Users/psa254/AppData/Local/miniconda3/envs/relu_enum/python.exe\" experiment_dynamics_complexity.py)"
+    ]
+  }
+}

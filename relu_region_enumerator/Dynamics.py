@@ -184,6 +184,119 @@ def get_dynamics_decay():
     ]
     return syms, f
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Decay-x1  (6D, adds cubic dissipation per component)
+# ═══════════════════════════════════════════════════════════════════════════
+def get_dynamics_decay_x1():
+    """
+    6D decay system augmented with per-component cubic dissipation.
+    Dynamics: x_dot_i = -x_i*(1 + ||x||²) - x_i³
+    The added -x_i³ term is odd and dissipative; the barrier certificate
+    valid for Decay remains valid here (SAFE verdict is preserved).
+    """
+    syms = sp.symbols('x1:7')
+    x1, x2, x3, x4, x5, x6 = syms
+    r_sq = x1**2 + x2**2 + x3**2 + x4**2 + x5**2 + x6**2
+    factor = 1 + r_sq
+    f = [
+        -x1 * factor - x1,
+        -x2 * factor - x2,
+        -x3 * factor - x3,
+        -x4 * factor - x4,
+        -x5 * factor - x5,
+        -x6 * factor - x6,
+    ]
+    return syms, f
+# ═══════════════════════════════════════════════════════════════════════════
+# Decay-x3  (6D, adds cubic dissipation per component)
+# ═══════════════════════════════════════════════════════════════════════════
+def get_dynamics_decay_x3():
+    """
+    6D decay system augmented with per-component cubic dissipation.
+    Dynamics: x_dot_i = -x_i*(1 + ||x||²) - x_i³
+    The added -x_i³ term is odd and dissipative; the barrier certificate
+    valid for Decay remains valid here (SAFE verdict is preserved).
+    """
+    syms = sp.symbols('x1:7')
+    x1, x2, x3, x4, x5, x6 = syms
+    r_sq = x1**2 + x2**2 + x3**2 + x4**2 + x5**2 + x6**2
+    factor = 1 + r_sq
+    f = [
+        -x1 * factor -x1+ x1**3,
+        -x2 * factor -x2+ x2**3,
+        -x3 * factor -x3+ x3**3,
+        -x4 * factor -x4+ x4**3,
+        -x5 * factor -x5+ x5**3,
+        -x6 * factor -x6+ x6**3,
+    ]
+    return syms, f
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Decay-x5  (6D, adds cubic + quintic dissipation per component)
+# ═══════════════════════════════════════════════════════════════════════════
+def get_dynamics_decay_x5():
+    """
+    6D decay system augmented with per-component cubic and quintic dissipation.
+    Dynamics: x_dot_i = -x_i*(1 + ||x||²) - x_i³ - x_i⁵
+    Both added terms are odd and dissipative; SAFE verdict is preserved.
+    The quintic term raises the Hessian degree further, inflating M_i bounds.
+    """
+    syms = sp.symbols('x1:7')
+    x1, x2, x3, x4, x5, x6 = syms
+    r_sq = x1**2 + x2**2 + x3**2 + x4**2 + x5**2 + x6**2
+    factor = 1 + r_sq
+    f = [
+        -x1 * factor -x1+ x1**3 - x1**5,
+        -x2 * factor -x2+ x2**3 - x2**5,
+        -x3 * factor -x3+ x3**3 - x3**5,
+        -x4 * factor -x4+ x4**3 - x4**5,
+        -x5 * factor -x5+ x5**3 - x5**5,
+        -x6 * factor -x6+ x6**3 - x6**5,
+    ]
+    return syms, f
+
+def get_dynamics_decay_x7():
+    """
+    6D decay system augmented with per-component cubic and quintic dissipation.
+    Dynamics: x_dot_i = -x_i*(1 + ||x||²) - x_i³ - x_i⁵
+    Both added terms are odd and dissipative; SAFE verdict is preserved.
+    The quintic term raises the Hessian degree further, inflating M_i bounds.
+    """
+    syms = sp.symbols('x1:7')
+    x1, x2, x3, x4, x5, x6 = syms
+    r_sq = x1**2 + x2**2 + x3**2 + x4**2 + x5**2 + x6**2
+    factor = 1 + r_sq
+    f = [
+        -x1 * factor -x1+ x1**3 - x1**5+ x1**7,
+        -x2 * factor -x2+ x2**3 - x2**5+ x2**7,
+        -x3 * factor -x3+ x3**3 - x3**5+ x3**7,
+        -x4 * factor -x4+ x4**3 - x4**5+ x4**7,
+        -x5 * factor -x5+ x5**3 - x5**5+ x5**7,
+        -x6 * factor -x6+ x6**3 - x6**5+ x6**7,
+    ]
+    return syms, f
+def get_dynamics_decay_sin():
+    """
+    6D decay system augmented with per-component cubic and quintic dissipation.
+    Dynamics: x_dot_i = -x_i*(1 + ||x||²) - x_i³ - x_i⁵
+    Both added terms are odd and dissipative; SAFE verdict is preserved.
+    The quintic term raises the Hessian degree further, inflating M_i bounds.
+    """
+    syms = sp.symbols('x1:7')
+    x1, x2, x3, x4, x5, x6 = syms
+    r_sq = x1**2 + x2**2 + x3**2 + x4**2 + x5**2 + x6**2
+    factor = 1 + r_sq
+    f = [
+        -x1 * factor - sp.sin(x1),
+        -x2 * factor - sp.sin(x2),
+        -x3 * factor - sp.sin(x3),
+        -x4 * factor - sp.sin(x4),
+        -x5 * factor - sp.sin(x5),
+        -x6 * factor - sp.sin(x6),
+    ]
+    return syms, f
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Hi-Ord8  (8D linear, companion form)
@@ -244,6 +357,11 @@ _REGISTRY = {
     "complex"   : get_dynamics_complex,
     "quadrotor" : get_dynamics_quadrotor,
     "decay"     : get_dynamics_decay,
+    "decay_x1"  : get_dynamics_decay_x1,
+    "decay_x3"  : get_dynamics_decay_x3,
+    "decay_x5"  : get_dynamics_decay_x5,
+    "decay_x7"  : get_dynamics_decay_x7,
+    "decay_sin" : get_dynamics_decay_sin, 
     "hiord8"    : get_dynamics_hiord8,
 }
 

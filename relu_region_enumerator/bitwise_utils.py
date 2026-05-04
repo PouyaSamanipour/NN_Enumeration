@@ -77,8 +77,8 @@ def generate_mask(vertices, hyperplanes, b, tolerance=1e-5):
                 mask = mask | (np.uint64(1) << np.uint64(h))
                 cntr += 1
         masks[i] = mask
-        if cntr < np.shape(hyperplanes)[1]:
-            print("Warning: bitmask result is sparse, check the tolerance")
+        # if cntr < np.shape(hyperplanes)[1]:
+        #     print("Warning: bitmask result is sparse, check the tolerance")
     return masks
 
 
@@ -102,8 +102,8 @@ def generate_mask_serial(vertices, hyperplanes, b, tolerance=1e-5):
                 mask = mask | (np.uint64(1) << np.uint64(h))
                 cntr += 1
         masks[i] = mask
-        if cntr < np.shape(hyperplanes)[1]:
-            print("Warning: bitmask result is sparse, check the tolerance")
+        # if cntr < np.shape(hyperplanes)[1]:
+        #     print("Warning: bitmask result is sparse, check the tolerance")
     return masks
 
 
@@ -505,6 +505,7 @@ def Enumerator_rapid(
     enumerate_poly = list(original_polytope_test)
 
     for i in range(len(hyperplanes)):
+        # print(f"Processing hyperplane {i+1}/{len(hyperplanes)} with {len(enumerate_poly)} polytopes...")
         if not enumerate_poly:
             break
         intact_poly = []
@@ -584,7 +585,12 @@ def Enumerator_rapid(
                         )
 
                 if len(created_verts) > n - 1:
-                    result = list(polytops_test)
+                    fv_in = _dedup_verts(np.asarray(polytops_test[0], dtype=np.float64))
+                    fv_out = _dedup_verts(np.asarray(polytops_test[1], dtype=np.float64))
+                    res=[]
+                    res.append(fv_in)
+                    res.append(fv_out)
+                    result = res
                 else:
                     result = [enumerate_poly[j]]
                     print(f"Warning: Slicer returned fewer than (n-1) intersection points; "                          f"this may lead to incorrect enumeration results for this hyperplane.")
@@ -618,7 +624,7 @@ def Enumerator_rapid(
     return enumerate_poly
 
 
-def _dedup_verts(verts: np.ndarray, tol: float = 1e-5) -> np.ndarray:
+def _dedup_verts(verts: np.ndarray, tol: float = 1e-6) -> np.ndarray:
     """Remove near-duplicate rows from a vertex array (L-inf grid snap)."""
     if len(verts) <= 1:
         return verts
@@ -778,8 +784,8 @@ def generate_mask_wide(vertices, hyperplanes, b, tolerance=1e-5):
                 word = np.uint64(h // 64)
                 bit  = np.uint64(h % 64)
                 masks[i, word] |= np.uint64(1) << bit
-        if cntr < np.shape(hyperplanes)[1]:
-            print("Warning: bitmask result is sparse, check the tolerance")
+        # if cntr < np.shape(hyperplanes)[1]:
+        #     print("Warning: bitmask result is sparse, check the tolerance")
     return masks
 
 

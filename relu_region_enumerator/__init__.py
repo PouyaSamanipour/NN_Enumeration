@@ -31,6 +31,7 @@ from .bitwise_utils import (
     RaggedPolytopeStorage,
     HybridRaggedStorage,
 )
+from .bitwise_utils_efficient import Enumerator_rapid_h5
 from .Dynamics import load_dynamics, list_systems
 from .hessian_bound import (
     HessianBounder,
@@ -47,6 +48,7 @@ __all__ = [
     "plotting_results",
     "Enumerator_rapid",
     "Enumerator_rapid_face",
+    "Enumerator_rapid_h5",
     "generate_mask",
     "slice_polytope_with_hyperplane",
     "slice_polytope_with_hyperplane_jit",

@@ -39,7 +39,8 @@ import numba as nb
 # from .hessian_bound import HessianBounder, compute_local_gradient
 from .hessian_bound import HessianBounder, compute_local_gradient
 
-from .bitwise_utils import Enumerator_rapid,finding_deep_hype, generate_mask_wide,slice_polytope_wide
+from .bitwise_utils import Enumerator_rapid, finding_deep_hype, generate_mask_wide,slice_polytope_wide
+from .bitwise_utils_efficient import Enumerator_rapid_h5
 from .Dynamics import load_dynamics, list_systems
 from .verify_certificate_face import verify_barrier
 from .verify_certificates import verify_lyapunov
@@ -651,6 +652,8 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
 
     FILTER_BATCH   = 5_000  # cells per IBP-filter batch (controls peak RAM)
 
+    saved_to_h5 = False
+
     for i in range(num_hidden_layers):
 
         if use_disk:
@@ -683,6 +686,47 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
                 print(f"  Layer {i}: processing cell {j} / {N_j}")
 
             _is_last_layer = _run_ibp and (i == num_hidden_layers - 1)
+            if i == num_hidden_layers - 1 and not use_disk:
+                saved_to_h5 = True
+                out_h5_temp = name_file + "_polytope.h5"
+                # if i == 0:
+                #     offsets, n_regions = Enumerator_rapid_h5(
+                #         hyperplanes[i], b[i],
+                #         original_polytope_test, TH,
+                #         [border_hyperplane], [border_bias],
+                #         parallel, np.array([1] * n_h), i,
+                #         out_h5_path=out_h5_temp,
+                #         use_wide=use_wide,
+                #         W_pos_ibp=W_pos_ibp if _run_ibp else None,
+                #         W_neg_ibp=W_neg_ibp if _run_ibp else None,
+                #         b_arr_ibp=b_arr_ibp if _run_ibp else None,
+                #         is_last_layer=_is_last_layer,
+                #     )
+                # else:
+                #     if use_disk and _h5f_in is not None:
+                #         cell_j = _ds_in[_offs_in[j]:_offs_in[j + 1]][:]
+                #     else:
+                #         cell_j = enumerate_poly[j]
+                #     hype1, bias1, border_hyperplane1, border_bias1 = finding_deep_hype(
+                #         hyperplanes, b,
+                #         cell_j,
+                #         border_hyperplane, border_bias,
+                #         i, n,
+                #     )
+                #     offsets, n_regions = Enumerator_rapid_h5(
+                #         hype1, bias1,
+                #         np.array([cell_j]), TH,
+                #         [border_hyperplane1], [border_bias1],
+                #         False,  # serial
+                #         np.array([1] * n_h), i,
+                #         out_h5_path=out_h5_temp,
+                #         use_wide=use_wide,
+                #         W_pos_ibp=W_pos_ibp if _run_ibp else None,
+                #         W_neg_ibp=W_neg_ibp if _run_ibp else None,
+                #         b_arr_ibp=b_arr_ibp if _run_ibp else None,
+                #         is_last_layer=_is_last_layer,
+                #     )
+                # continue
             if i == 0:
                 # First layer: all polytopes share the same input domain.
                 enumerate_poly_n = Enumerator_rapid(
@@ -905,6 +949,11 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
         else:
             # File already gone or never written (0 survivors).
             enumerate_poly = []
+    elif saved_to_h5:
+        with _open_h5_lock_tolerant(out_h5_temp, "r") as hf:
+            ds = hf["vertices"]
+            offsets_arr = hf["offsets"][:]
+            enumerate_poly = [ds[offsets_arr[k]:offsets_arr[k+1]][:] for k in range(len(offsets_arr)-1)]
     
     
     
@@ -940,20 +989,21 @@ def enumeration_function(NN_file, name_file, TH, mode, parallel,
     # ------------------------------------------------------------------
     # 6. Save full vertex representation to HDF5
     # ------------------------------------------------------------------
-    out_h5 = name_file + "_polytope.h5"
-    with _open_h5_lock_tolerant(out_h5, "w") as f:
-        file_offsets = np.zeros(len(enumerate_poly) + 1, dtype=np.int64)
-        for idx, p in enumerate(enumerate_poly):
-            file_offsets[idx + 1] = file_offsets[idx] + len(p)
-        f.create_dataset("offsets", data=file_offsets)
-        ds = f.create_dataset(
-            "vertices",
-            shape=(int(file_offsets[-1]), n),
-            dtype=np.float64,
-        )
-        for idx, p in enumerate(enumerate_poly):
-            ds[file_offsets[idx]:file_offsets[idx + 1]] = p
-    print(f"Polytope vertex data saved to: {out_h5}")
+    if not saved_to_h5:
+        out_h5 = name_file + "_polytope.h5"
+        with _open_h5_lock_tolerant(out_h5, "w") as f:
+            file_offsets = np.zeros(len(enumerate_poly) + 1, dtype=np.int64)
+            for idx, p in enumerate(enumerate_poly):
+                file_offsets[idx + 1] = file_offsets[idx] + len(p)
+            f.create_dataset("offsets", data=file_offsets)
+            ds = f.create_dataset(
+                "vertices",
+                shape=(int(file_offsets[-1]), n),
+                dtype=np.float64,
+            )
+            for idx, p in enumerate(enumerate_poly):
+                ds[file_offsets[idx]:file_offsets[idx + 1]] = p
+        print(f"Polytope vertex data saved to: {out_h5}")
 
     # Free enumerate_poly before verification — BC is a subset of it and
     # both would otherwise live in memory simultaneously during verify_barrier.
